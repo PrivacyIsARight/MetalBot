@@ -526,13 +526,73 @@ local function OnWorldChange()
     end
 end
 
-local function IsWeaponAA(weaponDefID)
+local aaWeaponCache = {}
+
+function cfg.IsAAWeapon(uDefID, weaponDefID)
+    if not weaponDefID then return false end
+    local perUnit
+    if uDefID then
+        perUnit = aaWeaponCache[uDefID]
+        if not perUnit then
+            perUnit = {}
+            aaWeaponCache[uDefID] = perUnit
+        end
+    end
+    local cached = perUnit and perUnit[weaponDefID]
+    if cached ~= nil then return cached end
+
+    local result = false
+
+    local d = uDefID and UnitDefs[uDefID]
+    if d and d.weapons then
+        for i = 1, #d.weapons do
+            local mount = d.weapons[i]
+            if mount.weaponDef == weaponDefID then
+                local ot = mount.onlyTargets
+                if ot and ot.vtol then
+                    result = true
+                    for cat, on in pairs(ot) do
+                        if on and cat ~= "vtol" then result = false break end
+                    end
+                end
+                break
+            end
+        end
+    end
+
     local wDef = WeaponDefs[weaponDefID]
-    if not wDef then return false end
-    local wName = sLower(wDef.name or "")
-    local wType = sLower(wDef.type or "")
-    local onlyCat = sLower(wDef.onlyTargetCategory or "")
-    return sFind(wName, "flak") or sFind(wType, "aa") or sFind(onlyCat, "vtol")
+    if not result and wDef then
+        local ot = wDef.onlyTargets
+        if ot and ot.vtol then
+            result = true
+            for cat, on in pairs(ot) do
+                if on and cat ~= "vtol" then result = false break end
+            end
+        else
+            local onlyCat = sLower(wDef.onlyTargetCategory or "")
+            if onlyCat ~= "" and onlyCat ~= "notair" then
+                result = onlyCat == "vtol"
+                if not result then
+                    for token in onlyCat:gmatch("%S+") do
+                        if token == "vtol" then result = true break end
+                    end
+                    if result then
+                        for token in onlyCat:gmatch("%S+") do
+                            if token ~= "vtol" then result = false break end
+                        end
+                    end
+                end
+            end
+        end
+        if not result then
+            local wName = sLower(wDef.name or "")
+            local wType = sLower(wDef.type or "")
+            result = (sFind(wName, "flak") or sFind(wType, "aa")) and true or false
+        end
+    end
+
+    if perUnit then perUnit[weaponDefID] = result end
+    return result
 end
 
 function widget:UnitDamaged(unitID, unitDefID, unitTeam, damage, paralyzer, weaponDefID, projectileID, attackerID, attackerDefID, attackerTeam)
@@ -540,8 +600,7 @@ function widget:UnitDamaged(unitID, unitDefID, unitTeam, damage, paralyzer, weap
 
     local ax, _, az = spGetUnitPosition(attackerID)
 
-    -- TODO: Work on this
-    if IsWeaponAA(weaponDefID) and ax then
+    if attackerDefID and cfg.IsAAWeapon(attackerDefID, weaponDefID) and ax then
         st.aaThreats[attackerID] = { x = ax, z = az, frame = st.frameNum }
     end
 
@@ -1597,14 +1656,7 @@ local function IsAAOnlyDef(defID)
     if d and d.weapons and #d.weapons > 0 then
         result = true
         for i = 1, #d.weapons do
-            local wDef = SafeGetWeaponDef(d.weapons[i].weaponDef)
-            if wDef then
-                local wType = wDef.type and sLower(wDef.type) or ""
-                local wName = wDef.name and sLower(wDef.name) or ""
-                local onlyCat = wDef.onlyTargetCategory and sLower(wDef.onlyTargetCategory) or ""
-                local isAA = sFind(wName, "flak") or sFind(wType, "aa") or sFind(onlyCat, "vtol")
-                if not isAA then result = false break end
-            end
+            if not cfg.IsAAWeapon(defID, d.weapons[i].weaponDef) then result = false break end
         end
     end
     aaOnlyDefCache[defID] = result
@@ -2718,14 +2770,7 @@ local function IsFighterDef(uDefID)
     if d and d.canFly and d.weapons then
         local hasGround = false
         for i = 1, #d.weapons do
-            local wDef = SafeGetWeaponDef(d.weapons[i].weaponDef)
-            if wDef then
-                local wType = wDef.type and sLower(wDef.type) or ""
-                local wName = wDef.name and sLower(wDef.name) or ""
-                local onlyCat = wDef.onlyTargetCategory and sLower(wDef.onlyTargetCategory) or ""
-                local isAA = sFind(wName, "flak") or sFind(wType, "aa") or sFind(onlyCat, "vtol")
-                if not isAA then hasGround = true break end
-            end
+            if not cfg.IsAAWeapon(uDefID, d.weapons[i].weaponDef) then hasGround = true break end
         end
         result = not hasGround
     end
@@ -2776,15 +2821,9 @@ local function IsAntiAirUnit(uDefID)
     local result = false
     if d and d.weapons then
         for i = 1, #d.weapons do
-            local wDef = SafeGetWeaponDef(d.weapons[i].weaponDef)
-            if wDef then
-                local wName = sLower(wDef.name or "")
-                local wType = sLower(wDef.type or "")
-                local onlyCat = sLower(wDef.onlyTargetCategory or "")
-                if sFind(wName, "flak") or sFind(wType, "aa") or sFind(onlyCat, "vtol") then
-                    result = true
-                    break
-                end
+            if cfg.IsAAWeapon(uDefID, d.weapons[i].weaponDef) then
+                result = true
+                break
             end
         end
     end
@@ -2796,6 +2835,7 @@ end
 -- ground units kite at the wrong distance. Fighters keep full range.
 local groundRangeCache = {}
 local function GetGroundRange(uDefID)
+    if not uDefID then return 0 end
     if groundRangeCache[uDefID] ~= nil then return groundRangeCache[uDefID] end
     local d = uDefID and UnitDefs[uDefID]
     local best = 0
@@ -2805,12 +2845,8 @@ local function GetGroundRange(uDefID)
         elseif d.weapons then
             for i = 1, #d.weapons do
                 local wDef = SafeGetWeaponDef(d.weapons[i].weaponDef)
-                if wDef then
-                    local wType = wDef.type and sLower(wDef.type) or ""
-                    local wName = wDef.name and sLower(wDef.name) or ""
-                    local onlyCat = wDef.onlyTargetCategory and sLower(wDef.onlyTargetCategory) or ""
-                    local isAA = sFind(wName, "flak") or sFind(wType, "aa") or sFind(onlyCat, "vtol")
-                    if not isAA and (wDef.range or 0) > best then best = wDef.range or 0 end
+                if not cfg.IsAAWeapon(uDefID, d.weapons[i].weaponDef) and wDef then
+                    if (wDef.range or 0) > best then best = wDef.range or 0 end
                 end
             end
         end
@@ -2819,6 +2855,39 @@ local function GetGroundRange(uDefID)
     return best
 end
 cfg.GetGroundRange = GetGroundRange
+
+function cfg.GetAAWeaponRange(uDefID)
+    local perUnit
+    if uDefID then
+        perUnit = aaWeaponCache[uDefID]
+        if not perUnit then
+            perUnit = {}
+            aaWeaponCache[uDefID] = perUnit
+        end
+    end
+    if perUnit and perUnit.range ~= nil then return perUnit.range end
+    local d = uDefID and UnitDefs[uDefID]
+    local best = 0
+    if d and d.weapons then
+        for i = 1, #d.weapons do
+            local wDef = SafeGetWeaponDef(d.weapons[i].weaponDef)
+            if wDef and cfg.IsAAWeapon(uDefID, d.weapons[i].weaponDef) then
+                if (wDef.range or 0) > best then best = wDef.range or 0 end
+            end
+        end
+    end
+    if perUnit then perUnit.range = best end
+    return best
+end
+
+function cfg.GetEngageRange(uDefID, targetDef)
+    if targetDef and targetDef.canFly then
+        local gr = cfg.GetGroundRange(uDefID)
+        local ar = cfg.GetAAWeaponRange(uDefID)
+        if ar > gr then return ar end
+    end
+    return cfg.GetGroundRange(uDefID)
+end
 
 -- Rough single-weapon DPS: a relative lethality estimate only
 local function GetWeaponDPS(wDef)
@@ -3542,14 +3611,15 @@ local function UpdateThreat(myTeam, myUnits, frame)
 
                             -- remember armed buildings with exact coords + range (LOS-only)
                             if inLos and eDef.maxWeaponRange and eDef.maxWeaponRange > 0 then
+                                local gRange = cfg.GetGroundRange(eDefID)
                                 local cur = enemyDefenses[uID]
                                 if cur then
-                                    cur.x, cur.z, cur.range = ex, ez, eDef.maxWeaponRange
+                                    cur.x, cur.z, cur.range = ex, ez, gRange
                                     cur.lastSeen = frame
                                 else
                                     enemyDefenses[uID] = {
                                         defID = eDefID, x = ex, z = ez,
-                                        range = eDef.maxWeaponRange,
+                                        range = gRange,
                                         cost = eDef.metalCost or 50,
                                         lastSeen = frame
                                     }
@@ -5597,11 +5667,12 @@ local function ProcessUnitOrders(unitID, frame)
 
         if hasWeapons then
             local maxRange = cfg.GetGroundRange(uDefID)
+            local airRange = mMax(maxRange, cfg.GetAAWeaponRange(uDefID))
             if maxRange > 200 then
                 local cmds = spGetUnitCommands(unitID, -1)
                 local cmd1 = cmds and cmds[1]
                 
-                local searchRadius = maxRange + 400
+                local searchRadius = airRange + 400
                 local cx, cy, cz, bestID, clusterSize, bestMetal, isGround =
                     FindBestClusterTarget(ux, uz, searchRadius, cfg.AOE_DAMAGE_RADIUS, uDefID)
 
@@ -5704,7 +5775,8 @@ local function ProcessUnitOrders(unitID, frame)
 
                     local nEx, nEz, nDistSq, nVx, nVz = nil, nil, mHuge, 0, 0
                     local enemyDPS, enemyHP = 0, 0
-                    local kiteScan = spGetUnitsInCylinder(ux, uz, maxRange)
+                    local nAir = false
+                    local kiteScan = spGetUnitsInCylinder(ux, uz, airRange)
                     if kiteScan then
                         for i = 1, #kiteScan do
                             local tID = kiteScan[i]
@@ -5728,6 +5800,7 @@ local function ProcessUnitOrders(unitID, frame)
                                         local d = dx*dx + dz*dz
                                         if d < nDistSq then
                                             nDistSq, nEx, nEz = d, ex, ez
+                                            nAir = (UnitDefs[tDefID] and UnitDefs[tDefID].canFly) or false
                                             local vx, _, vz = spGetUnitVelocity(tID)
                                             if vx then nVx, nVz = vx, vz else nVx, nVz = 0, 0 end
                                         end
@@ -5736,6 +5809,7 @@ local function ProcessUnitOrders(unitID, frame)
                             end
                         end
                     end
+                    local engageRange = nAir and airRange or maxRange
                     local shouldKite = false
                     if nEx and enemyDPS > 0 and hp and hp > 0 then
                         local ourDPS = cfg.GetUnitDPS(uDefID)
@@ -5746,7 +5820,7 @@ local function ProcessUnitOrders(unitID, frame)
                         end
                     end
                     if shouldKite
-                        and nDistSq < (maxRange * cfg.KITE_TRIGGER_RATIO) * (maxRange * cfg.KITE_TRIGGER_RATIO) then
+                        and nDistSq < (engageRange * cfg.KITE_TRIGGER_RATIO) * (engageRange * cfg.KITE_TRIGGER_RATIO) then
                         local kx, kz
                         if CanStrafeByDefID(uDefID) then
                             local awayX, awayZ = ux - nEx, uz - nEz
@@ -5755,11 +5829,11 @@ local function ProcessUnitOrders(unitID, frame)
                             local awayNX, awayNZ = awayX / awayLen, awayZ / awayLen
                             local closing = nVx * awayNX + nVz * awayNZ
                             local leadDist = mMax(0, closing) * cfg.KITE_LEAD_FRAMES
-                            local standoff = maxRange * cfg.KITE_STANDOFF_RATIO + leadDist
+                            local standoff = engageRange * cfg.KITE_STANDOFF_RATIO + leadDist
                             kx = nEx + awayNX * standoff
                             kz = nEz + awayNZ * standoff
                         else
-                            kx, kz = cfg.GetTangentialRetreat(unitID, ux, uz, nEx, nEz, maxRange * cfg.KITE_TANK_HOP)
+                            kx, kz = cfg.GetTangentialRetreat(unitID, ux, uz, nEx, nEz, engageRange * cfg.KITE_TANK_HOP)
                         end
                         local mapX, mapZ = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
                         kx = mMax(50, mMin(kx, mapX - 50))
@@ -5817,8 +5891,16 @@ local function ProcessUnitOrders(unitID, frame)
                             return
                         end
                     end
-                    local eMinR = mMax(60, maxRange * 0.95)
-                    local eMaxR = mMax(140, maxRange * 0.98)
+                    local eMinR, eMaxR
+                    if isGround and clusterSize >= cfg.CLUSTER_THRESHOLD then
+                        eMinR = mMax(60, maxRange * 0.95)
+                        eMaxR = mMax(140, maxRange * 0.98)
+                    else
+                        local tDefID = bestID and spGetUnitDefID(bestID)
+                        local sRange = cfg.GetEngageRange(uDefID, tDefID and UnitDefs[tDefID])
+                        eMinR = mMax(60, sRange * 0.95)
+                        eMaxR = mMax(140, sRange * 0.98)
+                    end
                     local sx, sz = nil, nil
                     if isGround and clusterSize >= cfg.CLUSTER_THRESHOLD then
                         sx, sz = GetFlankSpreadPos(unitID, cx, cz, eMinR, eMaxR, nil)
@@ -5870,7 +5952,8 @@ local function ProcessUnitOrders(unitID, frame)
             end
 
             if cx then
-                local uRange = cfg.GetGroundRange(uDefID)
+                local tDefID = bestID and spGetUnitDefID(bestID)
+                local uRange = cfg.GetEngageRange(uDefID, tDefID and UnitDefs[tDefID])
                 if isArty then
                     -- Hold at range limit once in range
                     local ddx, ddz = cx - ux, cz - uz
