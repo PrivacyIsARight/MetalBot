@@ -170,7 +170,7 @@ local canStrafeCache = {}
 
 function widget:GetInfo()
     return {
-        name      = "MetalAI",
+        name      = "MetalBot",
         desc      = "Robot plays metal maps",
         author    = "vexalous",
         date      = "2026",
