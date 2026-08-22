@@ -4353,7 +4353,7 @@ local function ProcessUnitOrders(unitID, frame)
             local wounded = (hp and maxHp and maxHp > 0) and (hp < maxHp - 0.5)
 
             local csts = Spring.GetUnitStates(unitID)
-            local isCloaked = csts and csts.cloaked
+            local isCloaked = csts and csts.cloak
 
             local dgunRange = 0
             local dgunEnergyCost = 0
