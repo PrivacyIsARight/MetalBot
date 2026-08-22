@@ -310,7 +310,7 @@ local cfg = {
     -- We're on metal maps, so hardcoding this probably isn't
     -- an issue, but who knows
 
-    ADV_FACTORY_PAYBACK_SECS = 30,
+    ADV_FACTORY_PAYBACK_SECS = 120,
 
     AOE_DAMAGE_RADIUS     = 256,
     CLUSTER_THRESHOLD     = 2,
