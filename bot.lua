@@ -269,13 +269,6 @@ local cfg = {
     UNEASE_ARMY_RATIO      = 0.5,
     UNEASE_OVERRUN_RATIO   = 1.25,  -- recall defenders worth a minimum of threat + ~25%
 
-    -- This scales with map size, but I
-    -- really want to find a better way to do this
-    -- TODO: Find a better way to do recalls
-
-
-    UNEASE_RECALL_RADIUS   = 3000,
-
     PERIMETER_PATROL_RING  = 700,
     UNEASE_WATCH_RING      = 800, 
     UNEASE_SCAN_BUFFER     = 1500,
@@ -486,7 +479,7 @@ local st = {
     uneaseDbg = {
         detected       = 0,
         fired          = 0,
-        noCands        = 0,   -- fired but no combat units within UNEASE_RECALL_RADIUS
+        noCands        = 0,   -- fired but had no combat units to send
         recalled       = 0,
         lastUnease     = 0,   -- unease at the last fired recall
     },
@@ -3729,7 +3722,7 @@ end
 
 
 local function SortDefenders(a, b)
-    return a.dist < b.dist
+    return a.eta < b.eta
 end
 
 local function UpdateDefenseCoordination(frame)
@@ -3746,17 +3739,15 @@ local function UpdateDefenseCoordination(frame)
     udbg.fired = udbg.fired + 1
     udbg.lastUnease = mFloor(st.unease)
 
-    local recallR2 = (cfg.UNEASE_RECALL_RADIUS * st.mapLinearScale) * (cfg.UNEASE_RECALL_RADIUS * st.mapLinearScale)
     local cands = {}
     for i = 1, st.myCombatUnitCount do
         local uID = st.myCombatUnits[i]
         local ux, _, uz = spGetUnitPosition(uID)
         if ux then
             local ddx, ddz = ux - st.uneaseX, uz - st.uneaseZ
-            local d2 = ddx * ddx + ddz * ddz
-            if d2 <= recallR2 then
-                cands[#cands + 1] = { id = uID, dist = d2 }
-            end
+            local uDef = UnitDefs[spGetUnitDefID(uID)]
+            local speed = uDef and uDef.speed or 0
+            cands[#cands + 1] = { id = uID, eta = (speed > 0) and (mSqrt(ddx * ddx + ddz * ddz) / speed) or mHuge }
         end
     end
     if #cands == 0 then
@@ -5458,11 +5449,7 @@ local function ProcessUnitOrders(unitID, frame)
 
         -- we don't care about microing against enemy raiders
         -- we need to kill them fast, and hopefully possibly distract them
-        local nearRaid = false
-        if (st.unease or 0) > 0 and st.uneaseX and st.uneaseZ then
-            local rdx, rdz = ux - st.uneaseX, uz - st.uneaseZ
-            nearRaid = (rdx*rdx + rdz*rdz) < ((cfg.UNEASE_RECALL_RADIUS * st.mapLinearScale) * (cfg.UNEASE_RECALL_RADIUS * st.mapLinearScale))
-        end
+        local nearRaid = st.currentDefenders[unitID] == true
 
         local hp, maxHp = spGetUnitHealth(unitID)
 
