@@ -4925,10 +4925,9 @@ local function ProcessUnitOrders(unitID, frame)
                     or (st.myFactoriesCount < supportableFactories and not st.metalStalling)
                     or (st.metalIncome >= 20 and not st.metalStalling)
 
-                -- Don't open a new lab while an existing one needs con turrets
-                -- debatable late game though as this might slow down expansion
-                -- TODO: Look into this
-                if (st.factoriesNeedingTurretsCount or 0) > 0 then
+                -- We don't need to open a new lab if one still needs con turrets
+                -- But if we're overflowing, then holding this back is stunting our growth
+                if not st.economySaturated and (st.factoriesNeedingTurretsCount or 0) > 0 then
                     canExpand = false
                 end
 
