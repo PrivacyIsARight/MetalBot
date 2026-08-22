@@ -296,12 +296,6 @@ local cfg = {
     SCOUT_LOCK_TTL         = 2400,
     SCOUTS_PER_FACTORY     = 1,
 
-     -- frames we remember an enemy base after last radar/LOS sight
-     -- ideally, I'd love to have this not be a specific value, and persist.
-     -- TODO: This
-
-    BASE_MEMORY_TTL        = 18000,
-
     ECONOMY_SATURATION_RATIO = 0.85,
     ECONOMY_INCOME_SLACK     = 1.5,
 
@@ -3043,7 +3037,7 @@ local function ComputeStrategicPlan(frame)
 
     local tempo = 0
     for _, b in pairs(st.enemyBases) do
-        if b.lastSeen and frame - b.lastSeen < cfg.BASE_MEMORY_TTL then
+        if b.lastSeen then
             local bDefID = b.id and spGetUnitDefID(b.id)
             local bDef = bDefID and UnitDefs[bDefID]
             if bDef then
@@ -3397,16 +3391,11 @@ local function UpdateThreat(myTeam, myUnits, frame)
     local spIsPosInLos = Spring.IsPosInLos
     local spGetUnitHealth = Spring.GetUnitHealth
     local myAllyTeamID = spGetMyAllyTeamID()
-    local baseTTL = cfg.BASE_MEMORY_TTL
     
     if enemyBases then
         for key, base in pairs(enemyBases) do
-            -- Drop bases we haven't even had a radar blip on in a long time.
-            if frame - (base.lastRadarSeen or 0) > baseTTL then
-                enemyBases[key] = nil
-                st.intelVersion = st.intelVersion + 1
-            -- LOS on the memorized location: check the structure is still alive
-            elseif spIsPosInLos(base.x, 0, base.z, myAllyTeamID) then
+            -- If we have LOS on the structure, check if it's still there
+            if spIsPosInLos(base.x, 0, base.z, myAllyTeamID) then
                 local hp = base.id and spGetUnitHealth(base.id)
                 if hp and hp > 0 then
                     base.lastSeen = frame
@@ -3426,9 +3415,7 @@ local function UpdateThreat(myTeam, myUnits, frame)
     local enemyDefenses = st.enemyDefenses
     if not enemyDefenses then enemyDefenses = {} st.enemyDefenses = enemyDefenses end
     for dID, dEnt in pairs(enemyDefenses) do
-        if frame - (dEnt.lastSeen or 0) > baseTTL then
-            enemyDefenses[dID] = nil
-        elseif spIsPosInLos(dEnt.x, 0, dEnt.z, myAllyTeamID) then
+        if spIsPosInLos(dEnt.x, 0, dEnt.z, myAllyTeamID) then
             local hp = spGetUnitHealth(dID)
             if hp and hp > 0 then
                 dEnt.lastSeen = frame
@@ -3665,10 +3652,9 @@ local function PickArmyTarget(frame)
 
     local bestKey, bestBase, bestDist = nil, nil, mHuge
     local rx, rz = st.army.targetX or 0, st.army.targetZ or 0
-    local baseTTL = cfg.BASE_MEMORY_TTL
     
     for key, base in pairs(enemyBases) do
-        if base.lastSeen and (frame - base.lastSeen < baseTTL) then
+        if base.lastSeen then
             local dx, dz = base.x - rx, base.z - rz
             local distSq = dx * dx + dz * dz
             
@@ -3686,11 +3672,9 @@ local function PickArmyTarget(frame)
         if st.enemyDefenses then
             local bestD2 = (cfg.DEFENSE_TARGET_RADIUS * st.mapLinearScale) * (cfg.DEFENSE_TARGET_RADIUS * st.mapLinearScale)
             for dID, dEnt in pairs(st.enemyDefenses) do
-                if frame - (dEnt.lastSeen or 0) < baseTTL then
-                    local dx, dz = dEnt.x - bestBase.x, dEnt.z - bestBase.z
-                    local d2 = dx*dx + dz*dz
-                    if d2 < bestD2 then bestD2, dBest = d2, dEnt end
-                end
+                local dx, dz = dEnt.x - bestBase.x, dEnt.z - bestBase.z
+                local d2 = dx*dx + dz*dz
+                if d2 < bestD2 then bestD2, dBest = d2, dEnt end
             end
         end
         if dBest then
