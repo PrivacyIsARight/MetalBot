@@ -259,6 +259,7 @@ local cfg = {
     CMD_DGUN              = CMD_DGUN,
     CMD_RESURRECT         = CMD_RESURRECT,
     CMD_FIRE_STATE        = CMD_FIRE_STATE,
+    CMD_MOVE_STATE        = CMD_MOVE_STATE,
 
     ENEMY_RECLAIM_MIN_COST_SECONDS = 2,  -- don't reclaim enemies worth < this many seconds of income
     ENEMY_RECLAIM_CHASE_RANGE  = 500,    -- how far mobile cons chase enemies to reclaim them
@@ -431,6 +432,7 @@ local st = {
     enemyArmyValue             = 0,   -- total metal of enemy MOBILE combat units seen (decays)
 
     fireStateSet                 = {},
+    moveStateSet                 = {},
 
     -- let's get a exclusive lock here so we don't
 	-- put two of the same support units on one unit
@@ -787,6 +789,7 @@ function widget:UnitDestroyed(unitID, unitDefID, teamID)
     st.factoryWaitState[unitID] = nil
     st.lastFactoryOrderFrame[unitID] = nil
     st.fireStateSet[unitID] = nil
+    st.moveStateSet[unitID] = nil
     st.combatReaimFrame[unitID] = nil
     retreatDirCache[unitID] = nil
     trapperTargets[unitID] = nil
@@ -4040,6 +4043,7 @@ local function ProcessUnitOrders(unitID, frame)
     local CMD_DGUN       = cfg.CMD_DGUN
     local CMD_RESURRECT  = cfg.CMD_RESURRECT
     local CMD_FIRE_STATE = cfg.CMD_FIRE_STATE
+    local CMD_MOVE_STATE = cfg.CMD_MOVE_STATE
 
     local uDefID = spGetUnitDefID(unitID)
     local uDef = uDefID and UnitDefs[uDefID]
@@ -4487,11 +4491,8 @@ local function ProcessUnitOrders(unitID, frame)
                 Spring.GiveOrderToUnit(unitID, CMD_CLOAK, {0}, {})
             end
         end
-		-- GRAVEROBBERS ARE BROKEN TODO: This
         local isGraverobber = uDef.canResurrect or (uDef.name and (sFind(sLower(uDef.name), "graverobber") or sFind(sLower(uDef.name), "lazarus") or sFind(sLower(uDef.name), "zagreus")))
         if isGraverobber then
-            -- Super jittery, and constantly switching between reclaiming and repairing
-            -- TODO: find a fix for this con turret nonsense
             local gEnemyUnit = FindEnemyReclaimTarget(ux, uz, (cfg.ENEMY_RECLAIM_CHASE_RANGE * st.mapLinearScale) or 1000, nil, nil, true)
             if gEnemyUnit then
                 local gcmds = spGetUnitCommands(unitID, 1)
@@ -4555,7 +4556,6 @@ local function ProcessUnitOrders(unitID, frame)
 
                 -- resurrect high value wrecks
                 -- We don't care about reclaiming, it's a metal map
-                -- GRAVEROBBERS ARE BROKEN TODO: This
                 local rezID, rezX, rezZ, rezMetal = FindResurrectTarget(ux, uz, 1600)
                 if rezID then
                     local dx, dz = rezX - ux, rezZ - uz
@@ -4599,75 +4599,133 @@ local function ProcessUnitOrders(unitID, frame)
 
         local isStationary = (not uDef.speed or uDef.speed == 0)
         if isStationary then
+            if not st.moveStateSet[unitID] then
+                spGiveOrderToUnit(unitID, CMD_MOVE_STATE, { 0 }, {})
+                st.moveStateSet[unitID] = true
+            end
             local myTeamID = spGetMyTeamID()
             local buildDist = uDef.buildDistance or 200
             local currentCmds = spGetUnitCommands(unitID, 1)
-            local isCurrentlyReclaiming = (currentCmds and #currentCmds > 0 and currentCmds[1].id == cfg.CMD_RECLAIM)
+            local cmd1 = currentCmds and currentCmds[1]
+            local curId = cmd1 and cmd1.id
+            local curParam = cmd1 and cmd1.params and cmd1.params[1]
+
             local enemyUnit = FindEnemyReclaimTarget(ux, uz, buildDist, myTeamID)
             if enemyUnit then
-                local cmd1 = currentCmds and currentCmds[1]
-                if not cmd1 or cmd1.id ~= cfg.CMD_RECLAIM or not cmd1.params or cmd1.params[1] ~= enemyUnit then
-                    spGiveOrderToUnit(unitID, CMD_STOP, {}, {})
+                if curId ~= cfg.CMD_RECLAIM or curParam ~= enemyUnit then
                     spGiveOrderToUnit(unitID, cfg.CMD_RECLAIM, { enemyUnit }, {})
                 end
                 return
             end
 
-            if isCurrentlyReclaiming then return end
+            local mStall = st.metalStalling
+            local eStall = st.energyStalling
+            if mStall or eStall then
+                if not eStall then
+                    local reclaimTarget = FindReclaimTarget(ux, uz, true, buildDist)
+                    if reclaimTarget then
+                        local fcmd = reclaimTarget + (Game and Game.maxUnits or 32768)
+                        if curId ~= cfg.CMD_RECLAIM or curParam ~= fcmd then
+                            spGiveOrderToUnit(unitID, cfg.CMD_RECLAIM, { fcmd }, {})
+                        end
+                        return
+                    end
+                end
 
-            if not currentCmds or #currentCmds == 0 or NeedsOrders(unitID, false, false, false) then
-                local reclaimTarget = FindReclaimTarget(ux, uz, true, buildDist)
-                if reclaimTarget then spGiveOrderToUnit(unitID, cfg.CMD_RECLAIM, { reclaimTarget + (Game and Game.maxUnits or 32768) }, {}) return end
+                local function WantsStallType(def)
+                    if not def then return false end
+                    if mStall and def.extractsMetal and def.extractsMetal > 0 then return true end
+                    if eStall then
+                        local n = def.name and sLower(def.name) or ""
+                        if (def.energyMake and def.energyMake > 0)
+                            or sFind(n, "wind") or sFind(n, "solar")
+                            or sFind(n, "fusion") or sFind(n, "geo") then return true end
+                    end
+                    return false
+                end
 
-                local nearby = spGetUnitsInCylinder(ux, uz, buildDist)
-                if nearby then
-                    local targetToRepair, maxDamage = nil, 0
-                    for k = 1, #nearby do
-                        local nID = nearby[k]
+                if curId == cfg.CMD_REPAIR and curParam then
+                    local cDefID = spGetUnitDefID(curParam)
+                    if WantsStallType(cDefID and UnitDefs[cDefID]) then
+                        local chp, cmax = spGetUnitHealth(curParam)
+                        if chp and cmax and chp < cmax then return end
+                    end
+                end
+
+                local targetFrame, bestProgress = nil, 0
+                local stallScan = spGetUnitsInCylinder(ux, uz, buildDist)
+                if stallScan then
+                    for k = 1, #stallScan do
+                        local nID = stallScan[k]
                         if nID ~= unitID and spGetUnitTeam(nID) == myTeamID then
-                            local nDef = spGetUnitDefID(nID) and UnitDefs[spGetUnitDefID(nID)]
-                            if nDef then
+                            local nDefID = spGetUnitDefID(nID)
+                            local nDef = nDefID and UnitDefs[nDefID]
+                            if nDef and WantsStallType(nDef) then
                                 local hp, maxHp = spGetUnitHealth(nID)
-                                if hp and maxHp and maxHp > 0 and hp < maxHp * cfg.CON_HEAL_THRESHOLD then
-                                    local nx, _, nz = spGetUnitPosition(nID)
-                                    if nx then
-                                        local dx, dz = nx - ux, nz - uz
-                                        if dx*dx + dz*dz <= buildDist * buildDist then
-                                            local damage = maxHp - hp
-                                            if damage > maxDamage then maxDamage, targetToRepair = damage, nID end
-                                        end
+                                if hp and maxHp and maxHp > 0 and hp < maxHp then
+                                    local progress = maxHp - hp
+                                    if progress > bestProgress then bestProgress, targetFrame = progress, nID end
+                                end
+                            end
+                        end
+                    end
+                end
+                if targetFrame then
+                    if curId ~= cfg.CMD_REPAIR or curParam ~= targetFrame then
+                        spGiveOrderToUnit(unitID, cfg.CMD_REPAIR, { targetFrame }, {})
+                    end
+                    return
+                end
+
+                if currentCmds and #currentCmds > 0 then
+                    spGiveOrderToUnit(unitID, CMD_STOP, {}, {})
+                end
+                return
+            end
+
+            if curId == cfg.CMD_REPAIR then return end
+
+            local nearby = spGetUnitsInCylinder(ux, uz, buildDist)
+            if nearby then
+                local targetToRepair, maxDamage = nil, 0
+                for k = 1, #nearby do
+                    local nID = nearby[k]
+                    if nID ~= unitID and spGetUnitTeam(nID) == myTeamID then
+                        local nDef = spGetUnitDefID(nID) and UnitDefs[spGetUnitDefID(nID)]
+                        if nDef then
+                            local hp, maxHp = spGetUnitHealth(nID)
+                            if hp and maxHp and maxHp > 0 and hp < maxHp * cfg.CON_HEAL_THRESHOLD then
+                                local nx, _, nz = spGetUnitPosition(nID)
+                                if nx then
+                                    local dx, dz = nx - ux, nz - uz
+                                    if dx*dx + dz*dz <= buildDist * buildDist then
+                                        local damage = maxHp - hp
+                                        if damage > maxDamage then maxDamage, targetToRepair = damage, nID end
                                     end
                                 end
                             end
                         end
                     end
-                    if targetToRepair then spGiveOrderToUnit(unitID, cfg.CMD_REPAIR, { targetToRepair }, {}) return end
                 end
-
-                if st.myFactoriesCount > 0 then
-                    if IsGuardingValidTarget(unitID, buildDist) then return end
-                    local inRangeFactories, inRangeCount, anyInRange = {}, 0, false
-                    for j = 1, st.myFactoriesCount do
-                        local fID = st.myFactories[j]
-                        local fx, _, fz = spGetUnitPosition(fID)
-                        if fx then
-                            local dx, dz = fx - ux, fz - uz
-                            if dx*dx + dz*dz <= buildDist * buildDist then
-                                anyInRange = true
-                                -- dont guard waited labs
-                                local waited = st.factoryWaitState[fID]
-                                if waited then
-                                    local fhp, fmax = spGetUnitHealth(fID)
-                                    if fhp and fmax and fhp < fmax then waited = false end
-                                end
-                                if not waited then inRangeCount = inRangeCount + 1 inRangeFactories[inRangeCount] = fID end
-                            end
-                        end
+                if targetToRepair then
+                    if curId ~= cfg.CMD_REPAIR or curParam ~= targetToRepair then
+                        spGiveOrderToUnit(unitID, cfg.CMD_REPAIR, { targetToRepair }, {})
                     end
-                    if inRangeCount > 0 then spGiveOrderToUnit(unitID, cfg.CMD_GUARD, { inRangeFactories[math.random(inRangeCount)] }, {}) return end
-                    -- drop stale guard
-                    if anyInRange then spGiveOrderToUnit(unitID, CMD_STOP, {}, {}) return end
+                    return
                 end
+            end
+
+            local reclaimTarget = FindReclaimTarget(ux, uz, true, buildDist)
+            if reclaimTarget then
+                local fcmd = reclaimTarget + (Game and Game.maxUnits or 32768)
+                if curId ~= cfg.CMD_RECLAIM or curParam ~= fcmd then
+                    spGiveOrderToUnit(unitID, cfg.CMD_RECLAIM, { fcmd }, {})
+                end
+                return
+            end
+
+            if currentCmds and #currentCmds > 0 then
+                spGiveOrderToUnit(unitID, CMD_STOP, {}, {})
             end
             return
         end
@@ -4707,12 +4765,8 @@ local function ProcessUnitOrders(unitID, frame)
             end
 
             if emergencyDef and CanAffordBuild(emergencyDef, true) then
-                local spot = nil
-                if emergencyType == "metal" then spot = GetNearestUnclaimedMetalSpot(ux, uz) end
-
                 local tx, ty, tz, facing, key
-                if spot then tx, ty, tz, facing, key = FindBuildSpot(spot.x, spot.z, emergencyDef, eSpacing, unitID, conBuildDist) end
-                if not tx then tx, ty, tz, facing, key = FindBuildSpot(ux, uz, emergencyDef, eSpacing, unitID, conBuildDist) end
+                tx, ty, tz, facing, key = FindBuildSpot(ux, uz, emergencyDef, eSpacing, unitID, conBuildDist, nil, nil, nil, true)
 
                 if tx then
                     spGiveOrderToUnit(unitID, CMD_STOP, {}, {})
@@ -4858,16 +4912,15 @@ local function ProcessUnitOrders(unitID, frame)
                         defID = chosenMex
                         local nearestMex, mexDistSq = GetNearestUnclaimedMetalSpot(ux, uz)
 
-                        if nearestMex then
-                            local skipMetal = false
-                            if mexDistSq > (cfg.MEX_SKIP_DIST * st.mapLinearScale) * (cfg.MEX_SKIP_DIST * st.mapLinearScale) and st.conUnitCount > 1 then
-                                if not st.metalStalling or (st.metalStalling and st.activeMexBuilders >= 2) then skipMetal = true end
-                            end
+                        local skipMetal = false
+                        if nearestMex and mexDistSq > (cfg.MEX_SKIP_DIST * st.mapLinearScale) * (cfg.MEX_SKIP_DIST * st.mapLinearScale) and st.conUnitCount > 1 then
+                            if not st.metalStalling or (st.metalStalling and st.activeMexBuilders >= 2) then skipMetal = true end
+                        end
 
-                            if skipMetal then defID = nil
-                            else tx, ty, tz, facing, key = FindBuildSpot(nearestMex.x, nearestMex.z, defID, st.metalMapMexSpacing, unitID, conBuildDist) end
+                        if skipMetal then
+                            defID = nil
                         else
-                            tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, st.metalMapMexSpacing, unitID, conBuildDist)
+                            tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil, true)
                         end
 
                         if not tx and defID then
@@ -4909,7 +4962,7 @@ local function ProcessUnitOrders(unitID, frame)
                         local eCost = UnitDefs[eID].metalCost or 0
                         local eSpacing = (eCost > 800) and 128 or cfg.ENERGY_GRID_SPACING
                         local eAx, eAz = clampAnchor(ux, uz)
-                        tx, ty, tz, facing, key = FindBuildSpot(eAx, eAz, defID, eSpacing, unitID, conBuildDist)
+                        tx, ty, tz, facing, key = FindBuildSpot(eAx, eAz, defID, eSpacing, unitID, conBuildDist, nil, nil, nil, true)
                         if tx then
                             claimRadius = eSpacing * 0.5
                             st.activeEnergyBuilders = st.activeEnergyBuilders + 1
@@ -5155,25 +5208,14 @@ local function ProcessUnitOrders(unitID, frame)
                 if isAntinuke then st.pendingAntinukeBlueprints = st.pendingAntinukeBlueprints + 1 end
                 spGiveOrderToUnit(unitID, -defID, { tx, ty, tz, facing }, {})
             else
-                if not tx and st.unclaimedMexCount > 0 then
-                    local spot = GetNearestUnclaimedMetalSpot(ux, uz)
-                    if spot then
-                        local dx, dz = spot.x - ux, spot.z - uz
-                        if dx*dx + dz*dz > 200*200 and (not IsUnitBuildingFactory(unitID)) then
-                            local sx, sz = GetFlankSpreadPos(unitID, spot.x, spot.z, cfg.ANTI_CLUMP_MIN, cfg.ANTI_CLUMP_MAX, nil)
-                            spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { sx, spGetGroundHeight(sx, sz), sz }, {}) return
-                        end
-                    end
-                elseif not tx and st.unclaimedMexCount == 0 and (#st.metalSpots == 0) then
-                    -- build a mex right next to the builder instead of
-                    -- wandering the map looking for spots that don't exist
+                if not tx and (st.unclaimedMexCount > 0 or #st.metalSpots == 0) then
                     local fDeficit = mMax(0, (st.metalPull or 0) - (st.metalIncome or 0))
                     local fBudget = mMax(1, math.ceil(fDeficit / cfg.GetMexGain()))
                     if (st.metalIncome or 0) < (cfg.METAL_MAP_MEX_INCOME_TARGET * st.mapAreaScale) then fBudget = mMax(fBudget, math.ceil(cfg.MEX_GROWTH_FLOOR * st.mapAreaScale)) end
                     if st.activeMexBuilders < fBudget and #cache.mex > 0 then
                         local mexID = cache.mex[#cache.mex]
                         if CanAffordBuild(mexID, true) then
-                            local mx, my, mz, mf, mkey = FindBuildSpot(ux, uz, mexID, st.metalMapMexSpacing, unitID, conBuildDist)
+                            local mx, my, mz, mf, mkey = FindBuildSpot(ux, uz, mexID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil, true)
                             if mx then
                                 local mDef = UnitDefs[mexID]
                                 st.claimedSpots[mkey] = { frame = frame, x = mx, z = mz, r2 = (st.metalMapMexSpacing * 0.5) * (st.metalMapMexSpacing * 0.5), isFactory = false, isAirFactory = false, facing = mf, defID = mexID, isMex = true }
@@ -5181,6 +5223,17 @@ local function ProcessUnitOrders(unitID, frame)
                                 spGiveOrderToUnit(unitID, -mexID, { mx, my, mz, mf }, {})
                                 return
                             end
+                        end
+                    end
+                end
+
+                if not tx and st.unclaimedMexCount > 0 then
+                    local spot = GetNearestUnclaimedMetalSpot(ux, uz)
+                    if spot then
+                        local dx, dz = spot.x - ux, spot.z - uz
+                        if dx*dx + dz*dz > 200*200 and (not IsUnitBuildingFactory(unitID)) then
+                            local sx, sz = GetFlankSpreadPos(unitID, spot.x, spot.z, cfg.ANTI_CLUMP_MIN, cfg.ANTI_CLUMP_MAX, nil)
+                            spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { sx, spGetGroundHeight(sx, sz), sz }, {}) return
                         end
                     end
                 end
@@ -5227,7 +5280,7 @@ local function ProcessUnitOrders(unitID, frame)
                 if dx*dx + dz*dz > 400*400 and (not IsUnitBuildingFactory(unitID)) then
                     spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { bx, spGetGroundHeight(bx, bz), bz }, {})
                 elseif (not IsUnitBuildingFactory(unitID)) then
-                    local patAngle = ((unitID % 251) + 1) * 0.025 + ((frame % 8) * 0.7853981633974483)
+                    local patAngle = ((unitID % 251) + 1) * 0.025
                     local patR = (st.baseRadius or 0) > 0 and st.baseRadius or 500
                     local pmx, pmz = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
                     local px = mMax(100, mMin(bx + mCos(patAngle) * patR, pmx - 100))
