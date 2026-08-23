@@ -2755,7 +2755,6 @@ local aaUnitCache = {}
 -- can queue a bomb order without having LOS
 -- this would be cleared once we do get LOS
 -- so the worst is a wasted bombing
--- TODO: work on this
 local bomberCache = {}
 local function IsBomberDef(uDefID)
     if not uDefID then return false end
@@ -3048,6 +3047,28 @@ local function FindBestClusterTarget(fromX, fromZ, searchRadius, aoeRadius, shoo
     
     local cy = spGetGroundHeight(cx, cz)
     return cx, cy, cz, eID[bestIdx], bestClusterSize, bestMetal, groundAttack
+end
+
+cfg.FindBombTargetFromMemory = function(fromX, fromZ)
+    local bases = st.enemyBases
+    if not bases then return nil end
+
+    local bestScore, bestX, bestY, bestZ = 0, nil, nil, nil
+
+    for _, b in pairs(bases) do
+        if b.lastSeen and b.lastSeen > 0 then
+            local dx, dz = b.x - fromX, b.z - fromZ
+            local dSq = dx * dx + dz * dz
+            local score = (b.cost or 100) / (1 + mSqrt(dSq) * 0.01)
+            if b.isFactory then score = score * 1.25 end
+            if score > bestScore then
+                bestScore = score
+                bestX, bestY, bestZ = b.x, b.y or 0, b.z
+            end
+        end
+    end
+
+    return bestX, bestY, bestZ
 end
 
 
@@ -3607,6 +3628,9 @@ local function UpdateThreat(myTeam, myUnits, frame)
                             if base then
                                 base.x, base.y, base.z = ex, ey, ez
                                 base.id = uID
+                                base.defID = eDefID
+                                base.cost = eDef.metalCost or 100
+                                base.isFactory = eDef.isFactory or nil
                                 if inLos then
                                     base.lastSeen = frame
                                     base.lastRadarSeen = frame
@@ -3616,6 +3640,9 @@ local function UpdateThreat(myTeam, myUnits, frame)
                             else
                                 enemyBases[key] = {
                                     id = uID, x = ex, y = ey, z = ez,
+                                    defID = eDefID,
+                                    cost = eDef.metalCost or 100,
+                                    isFactory = eDef.isFactory or nil,
                                     lastSeen = inLos and frame or 0,
                                     lastRadarSeen = frame
                                 }
@@ -5389,6 +5416,7 @@ local function ProcessUnitOrders(unitID, frame)
                         if not hp or hp <= 0 then shouldStop = true end
                     elseif #curParams >= 3 then
                         local tX, tZ = curParams[1], curParams[3]
+                        if not Spring.IsPosInLos(tX, 0, tZ, spGetMyAllyTeamID()) then return end
                         local targetRadius = mMax(maxRange * 0.6, cfg.AOE_DAMAGE_RADIUS * 1.5)
                         local enemiesAtPos = spGetUnitsInCylinder(tX, tZ, targetRadius)
                         local foundAlive = false
@@ -5780,6 +5808,24 @@ local function ProcessUnitOrders(unitID, frame)
                             and (cmd1.params[1] - bx) * (cmd1.params[1] - bx) + (cmd1.params[3] - bz) * (cmd1.params[3] - bz) < 200 * 200
                         if not alreadyGoing then
                             spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { bx, spGetGroundHeight(bx, bz), bz }, {})
+                        end
+                        return
+                    end
+                end
+
+                if not bestID and cfg.IsBomberDef(uDefID) then
+                    local bX, bY, bZ = cfg.FindBombTargetFromMemory(ux, uz)
+                    if bX then
+                        local alreadyBombing = cmd1 and cmd1.id == cfg.CMD_ATTACK and cmd1.params
+                            and cmd1.params[1] and cmd1.params[3]
+                            and (cmd1.params[1] - bX) * (cmd1.params[1] - bX) + (cmd1.params[3] - bZ) * (cmd1.params[3] - bZ) < 200 * 200
+                        if not alreadyBombing then
+                            if st.attackDbg then
+                                st.attackDbg.issued = st.attackDbg.issued + 1
+                                st.attackDbg.airIssued = st.attackDbg.airIssued + 1
+                                st.attackDbg.lastIssuedDef = uDef.name
+                            end
+                            spGiveOrderToUnit(unitID, cfg.CMD_ATTACK, { bX, bY or 0, bZ }, {})
                         end
                         return
                     end
