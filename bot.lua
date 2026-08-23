@@ -260,6 +260,7 @@ local cfg = {
     CMD_RESURRECT         = CMD_RESURRECT,
     CMD_FIRE_STATE        = CMD_FIRE_STATE,
     CMD_MOVE_STATE        = CMD_MOVE_STATE,
+    CMD_FLY               = (CMD and CMD.IDLEMODE) or nil,
 
     ENEMY_RECLAIM_MIN_COST_SECONDS = 2,  -- don't reclaim enemies worth < this many seconds of income
     ENEMY_RECLAIM_CHASE_RANGE  = 500,    -- how far mobile cons chase enemies to reclaim them
@@ -433,6 +434,7 @@ local st = {
 
     fireStateSet                 = {},
     moveStateSet                 = {},
+    flyStateSet                  = {},
 
     -- let's get a exclusive lock here so we don't
 	-- put two of the same support units on one unit
@@ -678,6 +680,10 @@ function widget:Initialize()
                     spGiveOrderToUnit(uID, CMD_FIRE_STATE, {2}, {})
                     st.fireStateSet[uID] = true
                 end
+                if d and d.canFly and cfg.CMD_FLY then
+                    spGiveOrderToUnit(uID, cfg.CMD_FLY, { 0 }, 0)
+                    st.flyStateSet[uID] = true
+                end
             end
         end
     end
@@ -781,6 +787,10 @@ function widget:UnitCreated(unitID, unitDefID, teamID)
         spGiveOrderToUnit(unitID, CMD_FIRE_STATE, {2}, {})
         st.fireStateSet[unitID] = true
     end
+    if d and d.canFly and cfg.CMD_FLY then
+        spGiveOrderToUnit(unitID, cfg.CMD_FLY, { 0 }, 0)
+        st.flyStateSet[unitID] = true
+    end
 end
 
 function widget:UnitDestroyed(unitID, unitDefID, teamID)
@@ -790,6 +800,7 @@ function widget:UnitDestroyed(unitID, unitDefID, teamID)
     st.lastFactoryOrderFrame[unitID] = nil
     st.fireStateSet[unitID] = nil
     st.moveStateSet[unitID] = nil
+    st.flyStateSet[unitID] = nil
     st.combatReaimFrame[unitID] = nil
     retreatDirCache[unitID] = nil
     trapperTargets[unitID] = nil
@@ -5297,6 +5308,11 @@ local function ProcessUnitOrders(unitID, frame)
         if uDef.weapons and #uDef.weapons > 0 and not st.fireStateSet[unitID] then
             spGiveOrderToUnit(unitID, CMD_FIRE_STATE, {2}, {})
             st.fireStateSet[unitID] = true
+        end
+
+        if uDef.canFly and cfg.CMD_FLY and not st.flyStateSet[unitID] then
+            spGiveOrderToUnit(unitID, cfg.CMD_FLY, { 0 }, 0)
+            st.flyStateSet[unitID] = true
         end
 
         local isScout = false
