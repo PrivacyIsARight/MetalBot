@@ -4203,7 +4203,7 @@ local function ProcessUnitOrders(unitID, frame)
                 if cDef and (cDef.metalCost or 0) >= 250 then advancedConID = cache.cons[i] break end
             end
             local needAdvancedCon = (advancedConID ~= nil)
-                and (st.advConCount or 0) < 8
+                and (st.advConCount or 0) < 1
                 and (st.metalIncome or 0) >= 40
                 and not st.metalStalling
 
