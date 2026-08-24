@@ -4181,7 +4181,6 @@ local function ProcessUnitOrders(unitID, frame)
             end
 
             local dynamicLazLimit = math.floor(st.combatUnitCount / 80) + math.floor(st.metalIncome / 400)
-            local dynamicJammerLimit = math.floor(st.metalIncome / 80) + math.floor(st.baseRadius / 1000)
             local dynamicRadarLimit = st.myFactoriesCount + math.floor(st.baseRadius / 600)
 
             local totalActiveProjects = st.incompleteFactoryCount + st.pendingFactoryBlueprints + st.unclaimedMexCount
@@ -4246,7 +4245,7 @@ local function ProcessUnitOrders(unitID, frame)
             end
 
             if not choice and realConBots >= 3 then
-                if st.jammerCount < dynamicJammerLimit and #cache.jammers > 0 and not st.metalStalling and not st.energyStalling then
+                if #cache.jammers > 0 and not st.metalStalling and not st.energyStalling and math.random() < 0.05 then
                     choice = cache.jammers[1] st.jammerCount = st.jammerCount + 1
                 elseif st.radarCount < dynamicRadarLimit and #cache.radars > 0 and not st.metalStalling and not st.energyStalling then
                     choice = cache.radars[1] st.radarCount = st.radarCount + 1
