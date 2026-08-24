@@ -4446,9 +4446,9 @@ local function ProcessUnitOrders(unitID, frame)
             if uDef.weapons then
                 for i = 1, #uDef.weapons do
                     local wDef = uDef.weapons[i].weaponDef and WeaponDefs[uDef.weapons[i].weaponDef]
-                    if wDef and wDef.commandFire then
+                    if wDef and (wDef.manualFire or wDef.commandFire) then
                         dgunRange = wDef.range or 250
-                        dgunEnergyCost = wDef.energyCost or 0
+                        dgunEnergyCost = wDef.energyCost or wDef.energyPerShot or 0
                         break
                     end
                 end
@@ -4481,7 +4481,7 @@ local function ProcessUnitOrders(unitID, frame)
             -- The dgun only fires because an enemy is on top of us
             -- TODO: Work further on dgun logic
             local curEnergy = Spring.GetTeamResources(myTeamID, "energy")
-            if dgunTarget and curEnergy >= dgunEnergyCost then
+            if dgunTarget and dgunEnergyCost > 0 and curEnergy and curEnergy >= dgunEnergyCost then
                 if isCloaked then
                     Spring.GiveOrderToUnit(unitID, CMD_CLOAK, {0}, {})
                 end
