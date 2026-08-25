@@ -2024,7 +2024,7 @@ end
 cfg.CanAffordCombatUnit = CanAffordCombatUnit
 
 -- I hate this nonsense
--- TODO: make it actualy tech up in time
+-- TODO: make it actually tech up in time
 cfg.CanTechUpToFactory = function(fID)
     local def = UnitDefs[fID]
     local cost = (def and def.metalCost) or 0
