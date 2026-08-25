@@ -329,6 +329,8 @@ local st = {
     factoryWaitState             = {},
     incompleteFactories          = {},
     incompleteFactoryCount       = 0,
+    hasAdvancedFactory  = false,
+    hasT2Lab            = false,
     combatReaimFrame             = {},
     pendingFactoryBlueprints     = 0,
     factoriesNeedingTurrets      = {},
@@ -2023,22 +2025,26 @@ local function CanAffordCombatUnit(defID)
 end
 cfg.CanAffordCombatUnit = CanAffordCombatUnit
 
--- I hate this nonsense
--- TODO: make it actually tech up in time
 cfg.CanTechUpToFactory = function(fID)
     local def = UnitDefs[fID]
-    local cost = (def and def.metalCost) or 0
+    if not def then return false end
 
-    local cheapestFactoryCost = GetCheapestFactoryInfo().cost or 0
-    if cost <= cheapestFactoryCost * cfg.ADV_FACTORY_TIER_RATIO then 
-        return true 
+    local techLevel = def.customParams and tonumber(def.customParams.techlevel) or 1
+
+    if techLevel <= 1 then
+        if st.hasT2Lab or (st.hasAdvancedFactory and (st.advConCount or 0) > 0) then
+            return false
+        end
+        return true
     end
+
+    local cost = def.metalCost or 0
 
     local paybackSecs = cfg.ADV_FACTORY_PAYBACK_SECS or 1
     local requiredIncome = cost / paybackSecs
 
-    if (st.metalIncome or 0) >= requiredIncome then 
-        return true 
+    if (st.metalIncome or 0) >= requiredIncome then
+        return true
     end
 
     local currentMetal = st.currentMetal or 0
@@ -3244,6 +3250,8 @@ local function UpdateMacroState(myTeam, units)
     st.activeMexBuilders, st.activeEnergyBuilders = 0, 0
     st.ourTech, st.armyValue = 0, 0
     st.myFactoriesCount, st.incompleteFactoryCount, st.factoriesNeedingTurretsCount = 0, 0, 0
+    st.hasAdvancedFactory = false
+    st.hasT2Lab = false
     st.myAntinukes, st.antinukeCount = {}, 0
     st.defenseCount = 0
     st.defenseGroundCount = 0
@@ -3292,6 +3300,14 @@ local function UpdateMacroState(myTeam, units)
                 if hp and maxHp and hp < maxHp then
                     st.incompleteFactoryCount = st.incompleteFactoryCount + 1
                     st.incompleteFactories[st.incompleteFactoryCount] = uID
+                else
+                    local techLevel = d.customParams and tonumber(d.customParams.techlevel) or 1
+                    if techLevel >= 2 then
+                        st.hasAdvancedFactory = true
+                        if techLevel == 2 then
+                            st.hasT2Lab = true
+                        end
+                    end
                 end
             end
 
