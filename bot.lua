@@ -78,6 +78,28 @@ local sLower  = string.lower
 local sFind   = string.find
 local sFormat = string.format
 
+do
+    local rawUnits    = spGetUnitsInCylinder
+    local rawFeatures = spGetFeaturesInCylinder
+    local function ClampInMap(x, z, r)
+        local mapX = Game.mapSizeX or 8192
+        local mapZ = Game.mapSizeZ or 8192
+        if r > mapX * 0.5 then r = mFloor(mapX * 0.5) end
+        if r > mapZ * 0.5 then r = mFloor(mapZ * 0.5) end
+        if x < r then x = r elseif x > mapX - r then x = mapX - r end
+        if z < r then z = r elseif z > mapZ - r then z = mapZ - r end
+        return x, z, r
+    end
+    function spGetUnitsInCylinder(x, z, r, ...)
+        x, z, r = ClampInMap(x, z, r)
+        return rawUnits(x, z, r, ...)
+    end
+    function spGetFeaturesInCylinder(x, z, r)
+        x, z, r = ClampInMap(x, z, r)
+        return rawFeatures(x, z, r)
+    end
+end
+
 local function UnitHash(unitID, salt)
     local h = (unitID * 2654435761 + salt * 40503) % 2147483647
     h = (h * 48271) % 2147483647
@@ -4080,7 +4102,6 @@ local function ProcessUnitOrders(unitID, frame)
     local spGetGroundHeight    = Spring.GetGroundHeight
     local spGetMyTeamID        = Spring.GetMyTeamID
     local spGetUnitHealth      = Spring.GetUnitHealth
-    local spGetUnitsInCylinder = Spring.GetUnitsInCylinder
     local spGetUnitTeam        = Spring.GetUnitTeam
     local spAreTeamsAllied     = Spring.AreTeamsAllied
     local spGetGaiaTeamID      = Spring.GetGaiaTeamID
