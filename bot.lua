@@ -209,7 +209,7 @@ local cfg = {
     COMBAT_REAIM_INTERVAL = 60,     -- frames between mid-move re-aims
 
     -- Cap units/frame when we're slow. It's probably best to optimize the code, but if
-    -- we can't do that, atleast we can do this.
+    -- we can't do that, at least we can do this.
 
     LOAD_TARGET_MS        = 1.0,
     LOAD_CEILING_MS       = 2.5,
@@ -256,7 +256,7 @@ local cfg = {
 
 	-- normally you would use guard here, but when a unit reverses
  	-- guarding can lead to the guarding unit ending up infront of the unit its guarding
- 	-- I actuallly am not sure this is even working properly TODO: look into this
+ 	-- I actually am not sure this is even working properly TODO: look into this
 
     SUPPORT_BEHIND_DIST  = 140,
 
@@ -287,7 +287,7 @@ local cfg = {
     ENEMY_RECLAIM_MIN_COST_SECONDS = 2,  -- don't reclaim enemies worth < this many seconds of income
     ENEMY_RECLAIM_CHASE_RANGE  = 500,    -- how far mobile cons chase enemies to reclaim them
 
-    ARMY_MIN_SIZE          = 2,          -- send atleast *something*
+    ARMY_MIN_SIZE          = 2,          -- send at least *something*
 
     UNEASE_FLOOR_INCOME_SECONDS = 30, 
     UNEASE_ARMY_RATIO      = 0.5,
@@ -674,7 +674,7 @@ end
 
 -- We have to do this because when spectating the game, it shows all units as ours
 -- This confuses the bot and causes a lot of lag from failed commands
--- Also worth nothing, that the engine reports everyone as spectating during the
+-- Also worth noting, that the engine reports everyone as spectating during the
 -- pre-game countdown, so only run this once the game is started.
 local function IsSpectating()
     if not Spring.GetSpectatingState then return false end
@@ -935,7 +935,7 @@ local function GetUnitForward(unitID)
 end
 
 -- Cache lava level, for the most lava level is unimportant, but some metal maps *can*
--- have lava on them, and so we want to be accomadating
+-- have lava on them, and so we want to be accommodating
 -- nil on non-lava maps; values < -9000 mean "not initialised yet".
 local lavaLevelCache = nil
 local lavaCheckFrame = -999999
@@ -1576,11 +1576,11 @@ local function PickPreferAir(list, isRandom)
 end
 
 local function IsAmphibiousCon(name, d)
-	-- I know I should be accomdatating to all metal maps, and *maybe*
+	-- I know I should be accommodating to all metal maps, and *maybe*
 	-- amphibious cons can be useful (somewhere?)
 	-- but in all metal maps that we have so far, there's generally no area where
 	-- making amphibious cons is better
-	-- they're more expesnive with worse stats
+	-- they're more expensive with worse stats
     -- If it were a metal map with a sea,
     -- i'd much rather make an air con
     local hName = GetHumanName(d)
@@ -3522,7 +3522,7 @@ end
 
 -- Only LOS-verified units become targets, so no chasing radar ghosts.
 -- This should catch the niche case where radar picks up enemy structures,
--- then the radar get's destroyed, and it creates a ghost
+-- then the radar gets destroyed, and it creates a ghost
 -- it will clear automatically whenever we do get LOS,
 -- but I don't want to commit our entire army unless we are certain
 -- that there is something there
@@ -3995,7 +3995,7 @@ local function AssignScoutOrder(unitID, frame)
     local maxCornerDist = math.sqrt(mapCX * mapCX + mapCZ * mapCZ)
     -- hard-penalise our half of the map, but we don't want to set this to 0,
     -- because someone could cheese that, but we do want to penalize our side
-    -- a turtelling enemy on our side *could* end up never being found
+    -- a turtling enemy on our side *could* end up never being found
     local homeX, homeZ = st.baseCenterX, st.baseCenterZ
     if not homeX and st.myCommanders[1] then homeX, _, homeZ = spGetUnitPosition(st.myCommanders[1]) end
     local axisX, axisZ
@@ -4096,7 +4096,7 @@ local function PushFrontier(unitID, ux, uz)
 end
 -- Very important function
 -- Handles all of the unit orders and commands
--- Nightmare to go thorugh
+-- Nightmare to go through
 local function ProcessUnitOrders(unitID, frame)
     -- Lua 5.1 caps us to 60 upvalues :(
     -- So we have to redeclare them here
@@ -5405,7 +5405,7 @@ local function ProcessUnitOrders(unitID, frame)
                 local baseBX, baseBZ = st.baseCenterX, st.baseCenterZ
                 -- Bring all the scouts back during a raid
                 -- The proper solution is for the bot to just use radar,
-                -- but that's easier said then done, which makes this a
+                -- but that's easier said than done, which makes this a
                 -- TODO: make the bot understand radar
                 if baseBX and ((st.unease or 0) > 0 or (unitID % 3) == 0) then
                     local ringR = (st.baseRadius or 400) + (cfg.PERIMETER_PATROL_RING * st.mapLinearScale)
