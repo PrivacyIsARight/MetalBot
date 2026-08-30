@@ -72,7 +72,14 @@ local mPi     = math.pi
 local tInsert = table.insert
 local tRemove = table.remove
 local tSort   = table.sort
-local tClear  = table.clear
+local tClear
+if type(table.clear) == "function" then
+    tClear = table.clear
+else
+    tClear = function(t)
+        for k in pairs(t) do t[k] = nil end
+    end
+end
 
 local sLower  = string.lower
 local sFind   = string.find
@@ -222,9 +229,12 @@ local cfg = {
 
     BUILD_SPACING         = 384,    -- grid spacing for factory/eco placement
     ENERGY_GRID_SPACING   = 64,
+    ENERGY_LINE_LEN       = 4,
+    ECO_CONS_FRACTION     = 0.4,
     SHIELD_GRID_SPACING   = 256,
     TURRET_SPACING        = 80,
     MIN_SPACING           = 32,     -- I don't think you can build stuff this close, but it (might?) help out performance wise adding this
+    TOUCH_GAP             = 24,
     LAVA_MARGIN           = 12,     -- build/move this far above the lava level
 
     ANTI_NUKE_KEEPOUT      = 160,
@@ -282,6 +292,7 @@ local cfg = {
     CMD_RESURRECT         = CMD_RESURRECT,
     CMD_FIRE_STATE        = CMD_FIRE_STATE,
     CMD_MOVE_STATE        = CMD_MOVE_STATE,
+    CMD_REPEAT            = (CMD and CMD.REPEAT) or 58,
     CMD_FLY               = (CMD and CMD.IDLEMODE) or nil,
 
     ENEMY_RECLAIM_MIN_COST_SECONDS = 2,  -- don't reclaim enemies worth < this many seconds of income
@@ -313,8 +324,8 @@ local cfg = {
     SCOUT_LOCK_TTL         = 2400,
     SCOUTS_PER_FACTORY     = 1,
 
-    ECONOMY_SATURATION_RATIO = 0.85,
-    ECONOMY_INCOME_SLACK     = 1.5,
+    ECONOMY_SATURATION_RATIO = 0.70,
+    ECONOMY_INCOME_SLACK     = 1.15,
 
     ADV_FACTORY_TIER_RATIO  = 2,
 
@@ -329,6 +340,10 @@ local cfg = {
     CONS_PER_FACTORY      = 6,	   -- We do this to prevent con spams
     CONS_BASE             = 8,
 
+    FACTORY_REPICK_INTERVAL = 180,
+
+    ECO_BLOCK_COPY_RADIUS    = 1200,
+
     MEX_SKIP_DIST         = 1000,  -- skip walking to a mex spot further than this
 
     ARMY_DEPRECIATION_RATE = 0.02, -- get the army moving, t1s are more useful early on
@@ -336,6 +351,14 @@ local cfg = {
     ANTI_CLUMP_MIN         = 220,
     ANTI_CLUMP_MAX         = 650,  -- anti-clump ring kept wide on purpose; a tight disc clumped the whole army
 }
+
+do
+    local function ClampToMapRadius(x, z)
+        local mapX, mapZ = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
+        return mMax(0, mMin(x, mapX)), mMax(0, mMin(z, mapZ))
+    end
+    cfg.ClampToMapRadius = ClampToMapRadius
+end
 
 local st = {
     frameNum                     = 0,
@@ -347,8 +370,12 @@ local st = {
     myFactoriesCount             = 0,
     factoryGuards                = {},
     factoryTurrets               = {},
+    factoryTurretCooldown        = {},
     conTurretHomes               = {},
     factoryWaitState             = {},
+    factoryRepeatSet             = {},
+    factoryProd                  = {},
+    factoryProdClass             = {},
     incompleteFactories          = {},
     incompleteFactoryCount       = 0,
     hasAdvancedFactory  = false,
@@ -377,6 +404,12 @@ local st = {
 
     activeMexBuilders            = 0,
     activeEnergyBuilders         = 0,
+
+    ecoBlockLeader               = nil,
+    ecoBlockType                 = nil,
+    ecoDbg                       = { sys = 0, basic = 0, adv = 0, wind = 0, solar = 0, fusion = 0, geo = 0, otherE = 0, mex = 0, needMetal = 0, needEnergy = 0, metalOrders = 0, energyOrders = 0 },
+
+    ecoStrip                     = nil,
 
     energyStalling               = false,
     metalStalling                = false,
@@ -485,6 +518,8 @@ local st = {
         noAfford       = 0,   -- target chosen but turrets are unaffordable
         noSpot         = 0,   -- FindBuildSpot found no tile
         placed         = 0,
+        firedTotal     = 0,
+        placedTotal    = 0,
         probeTiles     = 0,
         probeBlocked   = 0,
         probeInacc     = 0,   -- We can't get there (void, lava, etc) :(
@@ -646,7 +681,8 @@ function widget:UnitDamaged(unitID, unitDefID, unitTeam, damage, paralyzer, weap
                     fx = px - (vx / vlen) * wRange
                     fz = pz - (vz / vlen) * wRange
                 end
-            end
+end
+            fx, fz = cfg.ClampToMapRadius(fx, fz)
             st.suspectedThreatX = fx
             st.suspectedThreatZ = fz
             st.suspectedThreatFrame = st.frameNum
@@ -731,7 +767,7 @@ function widget:Initialize()
 
     st.scoutSectorCount = sectorCount
     st.mapAreaScale = (mapX * mapZ) / (8192 * 8192)
-    st.mapLinearScale = mSqrt(st.mapAreaScale)
+    st.mapLinearScale = (mapX + mapZ) / (2 * 8192)
     st.scoutMaxActive = mMax(1, mCeil(sectorCount * cfg.SCOUT_COVERAGE_RATIO))
     st.metalMapMexSpacing = (Game.extractorRadius or 24) * 4
 
@@ -1879,6 +1915,52 @@ local function GetNearestFactoryPos(ux, uz)
     return bestFx, bestFz
 end
 
+do
+    local function RoundSlot(v) return mFloor(v + 0.5) end
+
+    cfg.ComputeFactoryRowSlot = function(ux, uz, facing, facHalf, gap)
+        local dirX, dirZ = GetFacingVector(facing)
+        local perpX, perpZ = -dirZ, dirX
+        local step = (facHalf * 2) + gap
+
+        if st.myFactoriesCount == 0 then return ux, uz, facing end
+
+        local ax, az, bestDist = ux, uz, mHuge
+        for j = 1, st.myFactoriesCount do
+            local fID = st.myFactories[j]
+            local fx, _, fz = spGetUnitPosition(fID)
+            if fx then
+                local dx, dz = fx - ux, fz - uz
+                local d = dx * dx + dz * dz
+                if d < bestDist then bestDist, ax, az = d, fx, fz end
+            end
+        end
+
+        local usedSlots = {}
+        for j = 1, st.myFactoriesCount do
+            local fID = st.myFactories[j]
+            local fx, _, fz = spGetUnitPosition(fID)
+            if fx then
+                local fFacing = spGetUnitBuildFacing(fID) or facing
+                local fDirX, fDirZ = GetFacingVector(fFacing)
+                if fDirX * dirX + fDirZ * dirZ > 0.5 then
+                    local relX, relZ = fx - ax, fz - az
+                    usedSlots[RoundSlot((relX * perpX + relZ * perpZ) / step)] = true
+                end
+            end
+        end
+
+        local slot = 0
+        for side = 1, -1, -2 do
+            local s = side
+            while usedSlots[s] do s = s + side end
+            if not usedSlots[s] then slot = s break end
+        end
+
+        return ax + perpX * slot * step, az + perpZ * slot * step, facing
+    end
+end
+
 local function GetDominantFactoryDefID()
     if st.myFactoriesCount == 0 then return nil end
     local counts, bestDef, bestCount = {}, nil, 0
@@ -2381,8 +2463,9 @@ local function FindBuildSpot(ux, uz, defID, spacingOverride, excludeUnitID, pref
                 if nd.isFactory then
                     if IsAirFactory(ndID) then obsRadius = 120
                     else
-                        -- con turrets hug the lab, eco has to stay away
-                        if isConTurret then
+                        if isBuildingFactory then
+                            obsRadius = (mMax(nd.xsize or 8, nd.zsize or 8) * 8) / 2 + 8
+                        elseif isConTurret then
                             obsRadius = (mMax(nd.xsize or 8, nd.zsize or 8) * 8) / 2 + 8
                         else
                             obsRadius = select(2, FactoryTurretInfo(ndID))
@@ -2413,7 +2496,7 @@ local function FindBuildSpot(ux, uz, defID, spacingOverride, excludeUnitID, pref
         local cr2 = claim.r2
         -- con turrets can (and should) sit inside a lab's keep-out
         -- eco needs to stay away
-        if claim.isFactory and not claim.isAirFactory and isConTurret then
+        if claim.isFactory and not claim.isAirFactory and (isConTurret or isBuildingFactory) then
             local cDef = claim.defID and UnitDefs[claim.defID]
             local cR = (mMax(cDef and cDef.xsize or 8, cDef and cDef.zsize or 8) * 8) / 2 + 8
             cr2 = cR * cR
@@ -2962,7 +3045,8 @@ local function GetUnitDPS(defID)
                 local wName = wDef.name and sLower(wDef.name) or ""
                 local onlyCat = wDef.onlyTargetCategory and sLower(wDef.onlyTargetCategory) or ""
                 local isAA = sFind(wName, "flak") or sFind(wType, "aa") or sFind(onlyCat, "vtol")
-                if not isAA then total = total + GetWeaponDPS(wDef) end
+                local isDirectFire = wDef.manualFire or wDef.commandFire
+                if not isAA and not isDirectFire then total = total + GetWeaponDPS(wDef) end
             end
         end
     end
@@ -3219,10 +3303,10 @@ local function UpdateMacroState(myTeam, units)
         st.metalSpots = {}
     end
 
-    st.unclaimedMetalSpots = {}
-    st.unclaimedMexCount = 0
-    -- The occupancy scan is the most expensive part so only refresh it every other pass
+    st.unclaimedMetalSpots = st.unclaimedMetalSpots or {}
     if st.frameNum % (cfg.CHECK_INTERVAL * 2) == 0 then
+        st.unclaimedMexCount = 0
+        tClear(st.unclaimedMetalSpots)
         if st.metalSpots and #st.metalSpots > 0 then
             for i = 1, #st.metalSpots do
                 local spot = st.metalSpots[i]
@@ -3509,8 +3593,9 @@ local function UpdateMacroState(myTeam, units)
     for j = 1, st.myFactoriesCount do
         local fID = st.myFactories[j]
         local hp, maxHp = spGetUnitHealth(fID)
-        -- ring the lab from 50% construction up
-        if hp and maxHp and hp >= maxHp * 0.5 and (st.factoryTurrets[fID] or 0) < (FactoryTurretInfo(spGetUnitDefID(fID))) then
+        if hp and maxHp and hp >= maxHp * 0.5
+            and (st.factoryTurrets[fID] or 0) < (FactoryTurretInfo(spGetUnitDefID(fID)))
+            and (st.frameNum or 0) > (st.factoryTurretCooldown[fID] or 0) then
             st.factoriesNeedingTurretsCount = st.factoriesNeedingTurretsCount + 1
             st.factoriesNeedingTurrets[st.factoriesNeedingTurretsCount] = fID
         end
@@ -3581,6 +3666,10 @@ local function UpdateThreat(myTeam, myUnits, frame)
             enemyTeams[eTeamCount] = team 
         end
     end
+    local enemyTeamsMap = {}
+    for i = 1, eTeamCount do
+        enemyTeamsMap[enemyTeams[i]] = true
+    end
 
     -- Update scout sectors
     local refX, refZ = st.baseCenterX, st.baseCenterZ
@@ -3627,11 +3716,9 @@ local function UpdateThreat(myTeam, myUnits, frame)
     local uneaseSumX, uneaseSumZ, uneaseWeight = 0, 0, 0
     local enemyArmyValue = 0 -- total visible enemy mobile metal
 
-    for eIdx = 1, eTeamCount do
-        local eUnits = spGetTeamUnits(enemyTeams[eIdx])
-        if eUnits then
-            for i = 1, #eUnits do
-                local uID = eUnits[i]
+    for _, uID in ipairs(Spring.GetAllUnits() or {}) do
+        local eTeam = spGetUnitTeam(uID)
+        if eTeam and enemyTeamsMap[eTeam] then
                 local eDefID = spGetUnitDefID(uID)
                 local eDef = eDefID and unitDefs[eDefID]
                 if eDef then
@@ -3652,14 +3739,15 @@ local function UpdateThreat(myTeam, myUnits, frame)
                         isBaseWorthy = true
                     end
 
-                    local ex, ey, ez = spGetUnitPosition(uID)
-                    if ex then
+                    local ex, ey, ez = Spring.GetUnitViewPosition(uID) or spGetUnitPosition(uID)
+                    if ex and ez then
+                        ey = ey or spGetGroundHeight(ex, ez) or 0
                         local inLos = spIsPosInLos(ex, ey, ez, myAllyTeamID)
-                        if inLos and not isCmd and eDef.metalCost and eDef.metalCost > maxVisibleCost then
+                        if not isCmd and eDef.metalCost and eDef.metalCost > maxVisibleCost then
                             maxVisibleCost = eDef.metalCost
                         end
 
-                        if inLos and eDef.speed and eDef.speed > 0 and eDef.weapons and #eDef.weapons > 0 then
+                        if eDef.speed and eDef.speed > 0 and eDef.weapons and #eDef.weapons > 0 then
                             enemyArmyValue = enemyArmyValue + (eDef.metalCost or 50)
                         end
 
@@ -3723,7 +3811,7 @@ local function UpdateThreat(myTeam, myUnits, frame)
                                 local dist = dx2 + dz2
                                 local eSpeed = eDef.speed
 
-                                if dist < SCAN_SQ and eSpeed and eSpeed > 0 and inLos then
+                                if dist < SCAN_SQ and eSpeed and eSpeed > 0 then
                                     raiderCount = raiderCount + 1
                                     raiders[raiderCount] = uID
                                     local uw = eDef.metalCost or 50
@@ -3733,8 +3821,8 @@ local function UpdateThreat(myTeam, myUnits, frame)
                                     uneaseWeight = uneaseWeight + uw
                                 end
 
-                                -- prime target needs true LOS too
-                                if inLos and (threat > highestThreat or (threat == highestThreat and dist < bestDist)) then
+                                -- prime target
+                                if threat > highestThreat or (threat == highestThreat and dist < bestDist) then
                                     highestThreat = threat
                                     bestDist = dist
                                     bestX, bestY, bestZ = ex, ey, ez
@@ -3747,7 +3835,6 @@ local function UpdateThreat(myTeam, myUnits, frame)
                 end
             end
         end
-    end
 
     st.raiders = raiders
     st.raiderCount = raiderCount
@@ -3792,6 +3879,27 @@ local function PickArmyTarget(frame)
             if primeCost >= commitThreshold then
                 return primeTargetPos[1], primeTargetPos[2], primeTargetPos[3], "prime"
             end
+        end
+    end
+
+    if st.raiders and st.raiderCount and st.raiderCount > 0 then
+        local rx, rz = st.army.targetX or st.baseCenterX or 0, st.army.targetZ or st.baseCenterZ or 0
+        local bestRDist, bestRx, bestRy, bestRz, bestRKey = mHuge, nil, nil, nil, nil
+        for i = 1, st.raiderCount do
+            local rID = st.raiders[i]
+            local rx_pos, ry_pos, rz_pos = Spring.GetUnitViewPosition(rID) or spGetUnitPosition(rID)
+            if rx_pos then
+                local dx, dz = rx_pos - rx, rz_pos - rz
+                local d2 = dx * dx + dz * dz
+                if d2 < bestRDist then
+                    bestRDist = d2
+                    bestRx, bestRy, bestRz = rx_pos, ry_pos, rz_pos
+                    bestRKey = "raider_" .. rID
+                end
+            end
+        end
+        if bestRx then
+            return bestRx, bestRy or spGetGroundHeight(bestRx, bestRz), bestRz, bestRKey
         end
     end
 
@@ -3977,9 +4085,9 @@ local function AssignScoutOrder(unitID, frame)
         local flankAngle = angle + (math.random() > 0.5 and 0.4 or -0.4)
         local dist = math.random(400, 1000)
 
-        local mapX, mapZ = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
-        local flankX = mMax(0, mMin(targetBase.x + mCos(flankAngle) * dist, mapX))
-        local flankZ = mMax(0, mMin(targetBase.z + mSin(flankAngle) * dist, mapZ))
+        local flankX = targetBase.x + mCos(flankAngle) * dist
+        local flankZ = targetBase.z + mSin(flankAngle) * dist
+        flankX, flankZ = cfg.ClampToMapRadius(flankX, flankZ)
         flankX, flankZ = NudgeOutOfLava(flankX, flankZ, ux, uz)
 
         spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { flankX, spGetGroundHeight(flankX, flankZ), flankZ }, {})
@@ -4126,6 +4234,131 @@ local function ProcessUnitOrders(unitID, frame)
     local CMD_FIRE_STATE = cfg.CMD_FIRE_STATE
     local CMD_MOVE_STATE = cfg.CMD_MOVE_STATE
 
+    local function GetEconType(defID)
+        local ed = defID and UnitDefs[defID]
+        if not ed then return nil end
+        if ed.extractsMetal and ed.extractsMetal > 0 then return "metal" end
+        local en = sLower(ed.name or "")
+        if (ed.energyMake and ed.energyMake > 0)
+            or sFind(en, "wind") or sFind(en, "solar")
+            or sFind(en, "fusion") or sFind(en, "geo") or sFind(en, "turbine") then return "energy" end
+        return nil
+    end
+
+    local function CopyConBuildQueue(unitID, leaderID, wantsMetal)
+        if not leaderID or leaderID == unitID then return false end
+        if not spGetUnitDefID(leaderID) then return false end
+        local lcmds = spGetUnitCommands(leaderID, -1)
+        if not lcmds or #lcmds == 0 then return false end
+        local builds = {}
+        for i = 1, #lcmds do
+            local c = lcmds[i]
+            if c.id and c.id < 0 and GetEconType(-c.id) then
+                local isMex = UnitDefs[-c.id] and UnitDefs[-c.id].extractsMetal and UnitDefs[-c.id].extractsMetal > 0
+                if isMex == wantsMetal then builds[#builds + 1] = c end
+            end
+        end
+        if #builds == 0 then return false end
+        spGiveOrderToUnit(unitID, CMD_STOP, {}, {})
+        spGiveOrderToUnit(unitID, builds[1].id, builds[1].params, {})
+        for i = 2, #builds do
+            spGiveOrderToUnit(unitID, builds[i].id, builds[i].params, { "shift" })
+        end
+        return true
+    end
+
+    local function TryCopyEcoBlock(unitID, eLeader, wantsMetal, tx, tz)
+        if not spGetUnitDefID(eLeader) then
+            st.ecoBlockLeader, st.ecoBlockType = nil, nil
+            return false
+        end
+        local e_x, _, e_z = spGetUnitPosition(eLeader)
+        if e_x and ((e_x - tx) * (e_x - tx) + (e_z - tz) * (e_z - tz)) > (cfg.ECO_BLOCK_COPY_RADIUS * cfg.ECO_BLOCK_COPY_RADIUS) then
+            return false
+        end
+        if CopyConBuildQueue(unitID, eLeader, wantsMetal) then return true end
+        st.ecoBlockLeader, st.ecoBlockType = nil, nil
+        return false
+    end
+
+    local function EnsureEcoStrip(ux, uz, eSpacing)
+        local s = st.ecoStrip
+        if s then return s end
+        local horiz = (Game.mapSizeX or 8192) >= (Game.mapSizeZ or 8192)
+        local ax, az = ux, uz
+        if st.baseCenterX then ax, az = st.baseCenterX, st.baseCenterZ end
+        local step = mMax(eSpacing, 48)
+        if not horiz then
+            ax = ax + step * 2
+        else
+            az = az + step * 2
+        end
+        ax = mFloor(ax / step) * step
+        az = mFloor(az / step) * step
+        st.ecoStrip = { x = ax, z = az, horiz = horiz, step = step, next = 0, defID = nil }
+        return st.ecoStrip
+    end
+
+    local function NextEcoStripSlot(eSpacing, lineLen)
+        local s = st.ecoStrip
+        if not s then return nil end
+        local step = s.step or mMax(eSpacing, 48)
+        local line = mFloor(s.next / lineLen)
+        local pos = s.next % lineLen
+        s.next = s.next + 1
+        local sx, sz
+        if s.horiz then
+            sx = s.x + pos * step
+            sz = s.z + line * step
+        else
+            sx = s.x + line * step
+            sz = s.z + pos * step
+        end
+        return sx, sz
+    end
+
+    local function QueueEcoBlock(unitID, defID, ux, uz, buildDist, isMex)
+        local spacing = isMex and st.metalMapMexSpacing or ((UnitDefs[defID] and UnitDefs[defID].metalCost or 0) > 800 and 128 or cfg.ENERGY_GRID_SPACING)
+        local blockCount = 0
+        if not isMex then
+            local s = EnsureEcoStrip(ux, uz, spacing)
+            s.defID = s.defID or defID
+            defID = s.defID
+            spacing = ((UnitDefs[defID] and UnitDefs[defID].metalCost or 0) > 800) and 128 or cfg.ENERGY_GRID_SPACING
+            s.step = mMax(spacing, 48)
+            local lineLen = cfg.ENERGY_LINE_LEN or 12
+            local tries = 0
+            while tries < lineLen * 4 and blockCount < 4 do
+                tries = tries + 1
+                local bx, bz = NextEcoStripSlot(spacing, lineLen)
+                if not bx then break end
+                local by = spGetGroundHeight(bx, bz)
+                local bkey = (mFloor(bx / 32) * 100000) + mFloor(bz / 32)
+                local br2 = mMax(20, spacing * 0.5)
+                if not (st.claimedSpots and st.claimedSpots[bkey])
+                    and spTestBuildOrder(defID, bx, by, bz, 0) ~= 0 then
+                    st.claimedSpots[bkey] = { frame = frame, x = bx, z = bz, r2 = br2 * br2, isFactory = false, isAirFactory = false, facing = 0, defID = defID, isMex = false }
+                    st.pendingCommittedMetal = st.pendingCommittedMetal + (UnitDefs[defID].metalCost or 0)
+                    spGiveOrderToUnit(unitID, -defID, { bx, by, bz, 0 }, { "shift" })
+                    blockCount = blockCount + 1
+                end
+            end
+        else
+            while blockCount < 3 do
+                local bx, by, bz, bf, bkey = FindBuildSpot(ux, uz, defID, spacing, unitID, buildDist, nil, nil, nil)
+                if not bx then break end
+                local br2 = spacing * 0.5
+                st.claimedSpots[bkey] = { frame = frame, x = bx, z = bz, r2 = br2 * br2, isFactory = false, isAirFactory = false, facing = bf, defID = defID, isMex = isMex }
+                st.pendingCommittedMetal = st.pendingCommittedMetal + (UnitDefs[defID].metalCost or 0)
+                spGiveOrderToUnit(unitID, -defID, { bx, by, bz, bf }, { "shift" })
+                blockCount = blockCount + 1
+            end
+        end
+        if blockCount > 0 then
+            st.ecoBlockLeader, st.ecoBlockType = unitID, (isMex and "metal" or "energy")
+        end
+    end
+
     local uDefID = spGetUnitDefID(unitID)
     local uDef = uDefID and UnitDefs[uDefID]
     if not uDef then return end
@@ -4148,14 +4381,7 @@ local function ProcessUnitOrders(unitID, frame)
 
     if uDef.isFactory then
         local isStalling = st.metalStalling or st.energyStalling
-        -- we need cons to get out of a stall
-        -- let's not make any if we have a healthy amount and we're stalling
-        local wantConRecovery = isStalling and (
-            st.conUnitCount < 2
-            or (st.metalStalling and st.unclaimedMexCount > 0 and st.conUnitCount < 8)
-            or (st.energyStalling and st.conUnitCount < 4)
-        )
-        if isStalling and not wantConRecovery then
+        if isStalling then
             if not st.factoryWaitState[unitID] then
                 spGiveOrderToUnit(unitID, CMD_WAIT, {}, {})
                 st.factoryWaitState[unitID] = true
@@ -4167,29 +4393,35 @@ local function ProcessUnitOrders(unitID, frame)
             st.factoryWaitState[unitID] = nil
         end
 
-        if spGetFactoryCommands then
-            local factoryCmds = spGetFactoryCommands(unitID, -1)
-            if factoryCmds and #factoryCmds > 0 then return end
-        else
-            local currentCmds = spGetUnitCommands(unitID, -1)
-            if currentCmds and #currentCmds > 0 then return end
+        if not st.factoryRepeatSet[unitID] then
+            spGiveOrderToUnit(unitID, cfg.CMD_REPEAT, { 1 }, 0)
+            st.factoryRepeatSet[unitID] = true
         end
 
-        if (frame - (st.lastFactoryOrderFrame[unitID] or -30)) < 30 then return end
+        local factoryCmds = nil
+        if spGetFactoryCommands then
+            factoryCmds = spGetFactoryCommands(unitID, -1)
+        else
+            factoryCmds = spGetUnitCommands(unitID, -1)
+        end
+        local queueFull = factoryCmds and #factoryCmds > 0
 
-        if NeedsOrders(unitID, true, false, false) then
+        local minGap = queueFull and cfg.FACTORY_REPICK_INTERVAL or 30
+        if (frame - (st.lastFactoryOrderFrame[unitID] or -30)) < minGap then return end
+
+        if NeedsOrders(unitID, true, false, false) or queueFull then
             local cache = GetBuildCache(uDefID)
             local choice = nil
+            local choiceClass = nil
             local realConBots = mMax(0, st.conUnitCount)
+            local maxCons = st.myFactoriesCount * cfg.CONS_PER_FACTORY + cfg.CONS_BASE
 
-            -- while stalled the only unit worth queuing is a constructor
             if isStalling and #cache.cons > 0 then
                 local conID = PickPreferAir(cache.cons, false)
                 if conID then
-                    spGiveOrderToUnit(unitID, -conID, {}, {})
+                    choice = conID
+                    choiceClass = "con"
                     st.conUnitCount = st.conUnitCount + 1
-                    st.lastFactoryOrderFrame[unitID] = frame
-                    return
                 end
             end
 
@@ -4197,28 +4429,17 @@ local function ProcessUnitOrders(unitID, frame)
             local targetDefenders = 4
             if st.raiderCount > 0 then targetDefenders = mMin(10, mMax(6, st.raiderCount * 2)) end
 
-            -- get our scouts out fast, until we can find a better way to recognize enemy bases
-            -- that doesn't force us to make a scout ASAP
-            -- TODO: This
-            if not choice and st.scoutUnitCount == 0 and #cache.scouts > 0 then
-                local cheapestScout, cheapestCost = nil, mHuge
-                for i = 1, #cache.scouts do
-                    local sID = cache.scouts[i]
-                    local sCost = UnitDefs[sID] and UnitDefs[sID].metalCost or 0
-                    if CanAffordBuild(sID, true) and sCost < cheapestCost then
-                        cheapestCost, cheapestScout = sCost, sID
-                    end
-                end
-                if cheapestScout then
-                    choice = cheapestScout
-                    st.scoutUnitCount = st.scoutUnitCount + 1
-                end
+            if not choice and not queueFull and st.conUnitCount < maxCons and #cache.cons > 0 then
+                choice = PickPreferAir(cache.cons, false)
+                choiceClass = "con"
+                st.conUnitCount = st.conUnitCount + 1
             end
 
             if not choice and st.combatUnitCount < targetDefenders then
                 local cheapestDef = GetCheapestMobileDefense(cache)
                 if cheapestDef and CanAffordBuild(cheapestDef, true) then
                     choice = cheapestDef
+                    choiceClass = "defender"
                     st.combatUnitCount = st.combatUnitCount + 1
                 end
             end
@@ -4227,14 +4448,13 @@ local function ProcessUnitOrders(unitID, frame)
             local dynamicRadarLimit = st.myFactoriesCount + math.floor(st.baseRadius / 600)
 
             local totalActiveProjects = st.incompleteFactoryCount + st.pendingFactoryBlueprints + st.unclaimedMexCount
-            local maxCons = st.myFactoriesCount * cfg.CONS_PER_FACTORY + cfg.CONS_BASE
             local needMoreCons = false
             
-            if realConBots < maxCons then
-                if realConBots == 0 then needMoreCons = true
-                elseif st.metalStalling and st.unclaimedMexCount > 0 and realConBots < (st.unclaimedMexCount + 1) then needMoreCons = true
-                elseif st.energyStalling and realConBots < 3 then needMoreCons = true
-                elseif totalActiveProjects > 0 and realConBots < (totalActiveProjects * 2) then needMoreCons = true
+            if st.conUnitCount < maxCons then
+                if st.conUnitCount == 0 then needMoreCons = true
+                elseif st.metalStalling and st.unclaimedMexCount > 0 and st.conUnitCount < (st.unclaimedMexCount + 1) then needMoreCons = true
+                elseif st.energyStalling and st.conUnitCount < 3 then needMoreCons = true
+                elseif totalActiveProjects > 0 and st.conUnitCount < (totalActiveProjects * 2) then needMoreCons = true
                 elseif st.economySaturated then needMoreCons = true end
             end
 
@@ -4264,6 +4484,7 @@ local function ProcessUnitOrders(unitID, frame)
                 end
                 if choice then
                     st.conUnitCount = st.conUnitCount + 1
+                    choiceClass = "con"
                     local cDef = UnitDefs[choice]
                     if cDef and (cDef.metalCost or 0) >= 250 then st.advConCount = st.advConCount + 1 end
                 end
@@ -4282,6 +4503,7 @@ local function ProcessUnitOrders(unitID, frame)
                     end
                     if cheapestScout then
                         choice = cheapestScout
+                        choiceClass = "scout"
                         st.scoutUnitCount = st.scoutUnitCount + 1
                     end
                 end
@@ -4297,6 +4519,7 @@ local function ProcessUnitOrders(unitID, frame)
                 elseif #cache.trappers > 0 and st.combatUnitCount > 20 and math.random() < 0.05 then
                     choice = cache.trappers[1]
                 end
+                if choice and not choiceClass then choiceClass = "special" end
             end
 
             if not choice and (#cache.mobile > 0 or #cache.artillery > 0) then
@@ -4342,6 +4565,7 @@ local function ProcessUnitOrders(unitID, frame)
                         roll = roll - math.sqrt(mMin(ac, pickCostCap) + 1)
                         if roll <= 0 then choice = affordable[i] break end
                     end
+                    choiceClass = "combat"
                 else
                     -- nothing affordable: keep the factory moving anyway
                     local pool = cache.mobile
@@ -4351,17 +4575,31 @@ local function ProcessUnitOrders(unitID, frame)
                         for i = 1, #cache.artillery do pool[#pool + 1] = cache.artillery[i] end
                     end
                     choice = pool[math.random(#pool)]
+                    choiceClass = "combat"
                 end
             end
 
-            if not choice and #cache.cons > 0 then
+            if not choice and st.conUnitCount < maxCons and #cache.cons > 0 then
                 choice = PickPreferAir(cache.cons, true)
+                choiceClass = "con"
                 st.conUnitCount = st.conUnitCount + 1
             end
 
             if choice then
-                spGiveOrderToUnit(unitID, -choice, {}, {})
-                st.lastFactoryOrderFrame[unitID] = frame
+                local curClass = st.factoryProdClass[unitID]
+                if queueFull and curClass and curClass == choiceClass then
+                    st.lastFactoryOrderFrame[unitID] = frame
+                else
+                    if queueFull then
+                        for i = 2, #factoryCmds do
+                            spGiveOrderToUnit(unitID, factoryCmds[i].id, {}, { "right" })
+                        end
+                    end
+                    spGiveOrderToUnit(unitID, -choice, {}, {})
+                    st.factoryProd[unitID] = choice
+                    st.factoryProdClass[unitID] = choiceClass
+                    st.lastFactoryOrderFrame[unitID] = frame
+                end
             end
         end
 
@@ -4502,19 +4740,29 @@ local function ProcessUnitOrders(unitID, frame)
             -- track nearby mobile enemies so the commander can flee efficiently
             local nearby = spGetUnitsInCylinder(ux, uz, cfg.COMMANDER_SCAN_RADIUS)
             local dgunTarget = nil
+            local commDPS = cfg.GetUnitDPS(uDefID)
             local threatX, threatZ, threatCount = 0, 0, 0
             if nearby then
                 for i = 1, #nearby do
                     local nID = nearby[i]
                     local nTeam = spGetUnitTeam(nID)
                     if nTeam and nTeam ~= myTeamID and not spAreTeamsAllied(myTeamID, nTeam) then
-                        local nDef = spGetUnitDefID(nID) and UnitDefs[spGetUnitDefID(nID)]
+                        local nDefID = spGetUnitDefID(nID)
+                        local nDef = nDefID and UnitDefs[nDefID]
                         if nDef and not nDef.isBuilding then
                             local nx, _, nz = spGetUnitPosition(nID)
                             if nx then
                                 local dist = (nx-ux)*(nx-ux) + (nz-uz)*(nz-uz)
-                                threatX, threatZ, threatCount = threatX + nx, threatZ + nz, threatCount + 1
                                 if dist < dgunRangeSq then dgunTarget = nID end
+                                local enemyDPS = cfg.GetUnitDPS(nDefID)
+                                if enemyDPS > 0 then
+                                    local thp = spGetUnitHealth(nID)
+                                    local enemyHP = thp or (nDef.maxHealth or 100)
+                                    local weKillFirst = commDPS > 0 and (enemyHP / commDPS) < (hp / enemyDPS)
+                                    if not weKillFirst then
+                                        threatX, threatZ, threatCount = threatX + nx, threatZ + nz, threatCount + 1
+                                    end
+                                end
                             end
                         end
                     end
@@ -4824,7 +5072,8 @@ local function ProcessUnitOrders(unitID, frame)
             return
         end
 
-        local emergencyType = ((not IsUnitBuildingFactory(unitID))) and CheckEmergencyEconomy(unitID) or nil
+        local hasLabOrPending = st.myFactoriesCount > 0 or st.pendingFactoryBlueprints > 0
+        local emergencyType = (not IsUnitBuildingFactory(unitID)) and hasLabOrPending and CheckEmergencyEconomy(unitID) or nil
         if emergencyType then
             local cache = GetBuildCache(uDefID)
             local emergencyDef, eSpacing = nil, cfg.MIN_SPACING
@@ -4846,7 +5095,7 @@ local function ProcessUnitOrders(unitID, frame)
 
             if emergencyDef and CanAffordBuild(emergencyDef, true) then
                 local tx, ty, tz, facing, key
-                tx, ty, tz, facing, key = FindBuildSpot(ux, uz, emergencyDef, eSpacing, unitID, conBuildDist, nil, nil, nil, true)
+                tx, ty, tz, facing, key = FindBuildSpot(ux, uz, emergencyDef, eSpacing, unitID, conBuildDist, nil, nil, nil)
 
                 if tx then
                     spGiveOrderToUnit(unitID, CMD_STOP, {}, {})
@@ -4895,7 +5144,12 @@ local function ProcessUnitOrders(unitID, frame)
                 end
             end
             if not facDirX then
-                facDirX, facDirZ = mapX * 0.5 - ux, mapZ * 0.5 - uz
+                local ax, az = ux, uz
+                if st.myCommanders[1] then
+                    local cx2, _, cz2 = spGetUnitPosition(st.myCommanders[1])
+                    if cx2 then ax, az = cx2, cz2 end
+                end
+                facDirX, facDirZ = mapX * 0.5 - ax, mapZ * 0.5 - az
             end
             local facFacing
             if mAbs(facDirX) >= mAbs(facDirZ) then
@@ -4910,7 +5164,7 @@ local function ProcessUnitOrders(unitID, frame)
                 if dx*dx + dz*dz < (1200 * 1200) then isNearBase = true end
             else isNearBase = true end
 
-            if isNearBase then
+            if isNearBase and st.myFactoriesCount > 0 then
                 local reclaimTarget = FindReclaimTarget(ux, uz, true, conBuildDist)
                 if reclaimTarget and (st.metalStalling or math.random() < 0.25) then
                     spGiveOrderToUnit(unitID, cfg.CMD_RECLAIM, { reclaimTarget + (Game and Game.maxUnits or 32768) }, {}) return
@@ -4919,14 +5173,14 @@ local function ProcessUnitOrders(unitID, frame)
 
             if st.myFactoriesCount == 0 and (not IsUnitBuildingFactory(unitID)) and #cache.factories > 0 then
                 local starterFactory = GetCheapestVehicleFactory(cache) or cache.factories[#cache.factories]
-                if CanAffordBuild(starterFactory, true) then
+                if starterFactory and CanAffordBuild(starterFactory, true) then
                     defID = starterFactory
                     -- We want to place the first lab within
                     -- 80 elmos of the commanders range
                     -- So it doesn't have to walk to build it
                     local labDef = UnitDefs[defID]
                     local labKeepR = (mMax(labDef.xsize or 8, labDef.zsize or 8) * 8) / 2 + 48
-                    tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, 80, unitID, conBuildDist, labKeepR * labKeepR, facFacing)
+                    tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, 80, unitID, conBuildDist, labKeepR * labKeepR, facFacing, nil, true)
                     if tx then
                         claimRadius = IsAirFactory(defID) and 90 or select(2, FactoryTurretInfo(defID))
                         st.claimedSpots[key] = { frame = frame, x = tx, z = tz, r2 = claimRadius * claimRadius, isFactory = true, isAirFactory = IsAirFactory(defID), facing = facing, defID = defID, isMex = false }
@@ -4937,7 +5191,7 @@ local function ProcessUnitOrders(unitID, frame)
                 end
             end
 
-            if not tx and (not IsUnitBuildingFactory(unitID)) and (st.myFactoriesCount > 0 or st.pendingFactoryBlueprints > 0) and not st.economySaturated then
+            if not tx and (not IsUnitBuildingFactory(unitID)) and (st.myFactoriesCount > 0 or st.pendingFactoryBlueprints > 0) and not (st.economySaturated and st.plan.mode == "army") then
                 local overflowingEnergy = (st.currentEnergyStorage > 0) and (st.currentEnergy > st.currentEnergyStorage * 0.85)
                 local targetEnergy = mMax(st.energyPull * 1.15, mMin(st.metalIncome * 20, mMax(st.energyPull * 2, 600)), 100)
                 local overflowingMetal = (st.currentMetalStorage > 0) and (st.currentMetal > st.currentMetalStorage * 0.85)
@@ -4945,6 +5199,10 @@ local function ProcessUnitOrders(unitID, frame)
                 local energyDeficit = mMax(0, (st.energyPull or 0) - (st.energyIncome or 0))
                 local mexBudget = mMax(1, mMin(math.ceil(metalDeficit / cfg.GetMexGain()), mMax(1, st.unclaimedMexCount or 0)))
                 local energyBudget = mMax(1, math.ceil(energyDeficit / cfg.GetEnergyGain()))
+                local totalCons = mMax(1, st.conUnitCount)
+                local ecoConsCap = mMax(1, mFloor(totalCons * (cfg.ECO_CONS_FRACTION or 0.4)))
+                if mexBudget > ecoConsCap then mexBudget = ecoConsCap end
+                if energyBudget > ecoConsCap then energyBudget = ecoConsCap end
 
                 local needMetal = (st.metalStalling or st.unclaimedMexCount > 0) and not overflowingMetal
                 local needEnergy = st.energyStalling or ((st.energyIncome < targetEnergy) and not overflowingEnergy)
@@ -4960,19 +5218,32 @@ local function ProcessUnitOrders(unitID, frame)
                 if st.activeEnergyBuilders >= energyBudget then needEnergy = false end
 
                 if not needEnergy and not needMetal then
-                    -- keep a con on eco rather than idling
-                    local energyStillNeeded = (st.energyIncome < targetEnergy) and not overflowingEnergy
-                    if st.activeMexBuilders < mexBudget and st.activeEnergyBuilders < energyBudget then
-                        if math.random() < 0.5 then needMetal = true elseif energyStillNeeded then needEnergy = true end
-                    elseif st.activeMexBuilders < mexBudget then needMetal = true
-                    elseif st.activeEnergyBuilders < energyBudget then
-                        if energyStillNeeded then needEnergy = true end
+                    if (st.factoriesNeedingTurretsCount or 0) == 0 then
+                        local energyStillNeeded = (st.energyIncome < targetEnergy) and not overflowingEnergy
+                        if st.activeMexBuilders < mexBudget and st.activeEnergyBuilders < energyBudget then
+                            if math.random() < 0.5 then needMetal = true elseif energyStillNeeded then needEnergy = true end
+                        elseif st.activeMexBuilders < mexBudget then needMetal = true
+                        elseif st.activeEnergyBuilders < energyBudget then
+                            if energyStillNeeded then needEnergy = true end
+                        end
                     end
                 end
                 if needEnergy and needMetal then
-                    if st.energyStalling then needMetal = false elseif st.metalStalling then needEnergy = false else if math.random() < 0.65 then needMetal = false else needEnergy = false end end
+                    if st.energyStalling then needMetal = false elseif st.metalStalling then needEnergy = false
+                    elseif st.plan.mode == "energy" then needMetal = false
+                    elseif st.plan.mode == "mex" then needEnergy = false
+                    else if math.random() < 0.65 then needMetal = false else needEnergy = false end end
                 elseif needEnergy then needMetal = false
                 elseif needMetal then needEnergy = false end
+                if needMetal then st.ecoDbg.needMetal = st.ecoDbg.needMetal + 1 end
+                if needEnergy then st.ecoDbg.needEnergy = st.ecoDbg.needEnergy + 1 end
+
+                if not tx and needMetal and st.ecoBlockLeader and st.ecoBlockLeader ~= unitID
+                    and st.ecoBlockType == "metal" and st.activeMexBuilders < mexBudget then
+                    if TryCopyEcoBlock(unitID, st.ecoBlockLeader, true, ux, uz) then
+                        return
+                    end
+                end
 
                 if not tx and needMetal and #cache.mex > 0 then
                     local chosenMex = nil
@@ -5000,24 +5271,13 @@ local function ProcessUnitOrders(unitID, frame)
                         if skipMetal then
                             defID = nil
                         else
-                            tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil, true)
-                        end
-
-                        if not tx and defID then
-                        -- Important, We NEVER want to upgrade existing
-                        -- mexes. Theres no "tax credit" we're going to get
-                        -- for making our mexes more efficient
-                        -- it's wasted money
-                            if #st.metalSpots == 0 then
-                                local sx, sz = GetFlankSpreadPos(unitID, ux, uz, st.metalMapMexSpacing * 2, st.metalMapMexSpacing * 6, nil)
-                                spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { sx, spGetGroundHeight(sx, sz), sz }, {})
-                                return
-                            end
+                            tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil)
                         end
 
                         if tx and defID then
                             claimRadius = st.metalMapMexSpacing * 0.5
                             st.activeMexBuilders = st.activeMexBuilders + 1
+                            st.ecoDbg.metalOrders = st.ecoDbg.metalOrders + 1
                         end
                     end
                 end
@@ -5041,11 +5301,30 @@ local function ProcessUnitOrders(unitID, frame)
                         defID = eID
                         local eCost = UnitDefs[eID].metalCost or 0
                         local eSpacing = (eCost > 800) and 128 or cfg.ENERGY_GRID_SPACING
-                        local eAx, eAz = clampAnchor(ux, uz)
-                        tx, ty, tz, facing, key = FindBuildSpot(eAx, eAz, defID, eSpacing, unitID, conBuildDist, nil, nil, nil, true)
-                        if tx then
-                            claimRadius = eSpacing * 0.5
-                            st.activeEnergyBuilders = st.activeEnergyBuilders + 1
+                        local s = EnsureEcoStrip(ux, uz, eSpacing)
+                        s.defID = s.defID or defID
+                        defID = s.defID
+                        eSpacing = ((UnitDefs[defID] and UnitDefs[defID].metalCost or 0) > 800) and 128 or cfg.ENERGY_GRID_SPACING
+                        s.step = mMax(eSpacing, 48)
+                        local lineLen = cfg.ENERGY_LINE_LEN or 12
+                        local tries = 0
+                        while tries < lineLen do
+                            tries = tries + 1
+                            local sx, sz = NextEcoStripSlot(eSpacing, lineLen)
+                            if not sx then break end
+                            local sy = spGetGroundHeight(sx, sz)
+                            local skey = (mFloor(sx / 32) * 100000) + mFloor(sz / 32)
+                            if not (st.claimedSpots and st.claimedSpots[skey])
+                                and spTestBuildOrder(defID, sx, sy, sz, 0) ~= 0 then
+                                tz, key = sz, skey
+                                tx, ty, facing = sx, sy, 0
+                                st.claimedSpots[skey] = { frame = frame, x = sx, z = sz, r2 = mMax(20, eSpacing * 0.5) * mMax(20, eSpacing * 0.5), isFactory = false, isAirFactory = false, facing = 0, defID = defID, isMex = false }
+                                st.pendingCommittedMetal = st.pendingCommittedMetal + (UnitDefs[defID].metalCost or 0)
+                                claimRadius = eSpacing * 0.5
+                                st.activeEnergyBuilders = st.activeEnergyBuilders + 1
+                                st.ecoDbg.energyOrders = st.ecoDbg.energyOrders + 1
+                                break
+                            end
                         end
                     end
                 end
@@ -5066,6 +5345,7 @@ local function ProcessUnitOrders(unitID, frame)
             if not tx and #cache.conTurrets > 0 then
                 if st.factoriesNeedingTurretsCount > 0 then
                     st.turretDbg.fired = st.turretDbg.fired + 1
+                    st.turretDbg.firedTotal = (st.turretDbg.firedTotal or 0) + 1
                     local targetFactory = st.factoriesNeedingTurrets[1]
                     local fewest = st.factoryTurrets[targetFactory] or 0
                     for tk = 2, st.factoriesNeedingTurretsCount do
@@ -5086,11 +5366,22 @@ local function ProcessUnitOrders(unitID, frame)
                             spacing = mMax(40, turFoot + 16)
                             local facDef = UnitDefs[spGetUnitDefID(targetFactory)]
                             local facHalf = (mMax(facDef and facDef.xsize or 8, facDef and facDef.zsize or 8) * 8) / 2
-                            local ringOut = mMin(facHalf + spacing * 4, cfg.BUILD_RADIUS)
-                            tx, ty, tz, facing, key = FindBuildSpot(fx, fz, defID, spacing, unitID, ringOut, nil, nil, true, nil, facHalf)
+                            local ftFacing = spGetUnitBuildFacing(targetFactory) or 0
+                            local fDirX, fDirZ = GetFacingVector(ftFacing)
+                            local perpX, perpZ = -fDirZ, fDirX
+                            local slot = st.factoryTurrets[targetFactory] or 0
+                            local rowLen = 3
+                            local layer = mFloor(slot / rowLen)
+                            local along = slot % rowLen
+                            local backDist = facHalf + spacing + layer * spacing
+                            local bx = fx - fDirX * backDist + perpX * along * spacing
+                            local bz = fz - fDirZ * backDist + perpZ * along * spacing
+                            local turretRing = mMax(conBuildDist, facHalf + spacing * 8)
+                            tx, ty, tz, facing, key = FindBuildSpot(bx, bz, defID, spacing, unitID, turretRing, nil, nil, nil, true)
                         end
                         if tx then
                             st.turretDbg.placed = st.turretDbg.placed + 1
+                            st.turretDbg.placedTotal = (st.turretDbg.placedTotal or 0) + 1
                             claimRadius = spacing
                             st.factoryTurrets[targetFactory] = (st.factoryTurrets[targetFactory] or 0) + 1
                             -- Remember WHICH lab this turret was ordered for, so the
@@ -5108,6 +5399,7 @@ local function ProcessUnitOrders(unitID, frame)
                             end
                         else
                             st.turretDbg.noSpot = st.turretDbg.noSpot + 1
+                            st.factoryTurretCooldown[targetFactory] = frame + 900
                             defID = nil
                         end
                     end
@@ -5121,12 +5413,14 @@ local function ProcessUnitOrders(unitID, frame)
             local activeFactoryBuilds = st.incompleteFactoryCount + st.pendingFactoryBlueprints
             if not tx and #cache.factories > 0 and activeFactoryBuilds < 6 and st.myFactoriesCount > 0 then
 
-                -- Somehow we do 1 factory per 5 income, and yet we're still overflowing
                 local availableMetal = mMax(0, st.currentMetal - st.pendingCommittedMetal)
-                local supportableFactories = math.floor(st.metalIncome / 5)
+                local supportableFactories = mMin(math.floor(st.metalIncome / 10), mMax(2, math.floor(st.mapLinearScale * 4)))
                 local canExpand = st.economySaturated
-                    or (st.myFactoriesCount < supportableFactories and not st.metalStalling)
-                    or (st.metalIncome >= 20 and not st.metalStalling)
+                    or (st.myFactoriesCount < supportableFactories and not st.metalStalling and st.metalIncome >= 15)
+                    or (st.metalIncome >= 30 and st.myFactoriesCount < mMax(2, math.floor(st.mapLinearScale * 3)) and not st.metalStalling)
+                if st.plan.mode == "army" and st.metalIncome >= 20 and not st.metalStalling then
+                    canExpand = true
+                end
 
                 -- We don't need to open a new lab if one still needs con turrets
                 -- But if we're overflowing, then holding this back is stunting our growth
@@ -5134,11 +5428,9 @@ local function ProcessUnitOrders(unitID, frame)
                     canExpand = false
                 end
 
-                -- Make one of each factory type, cheapest lab first
                 local missingFacID = nil
                 local missingFacCost = mHuge
-                for i = 1, #cache.factories do
-                    local fID = cache.factories[i]
+                local function considerFactory(fID)
                     local fCost = UnitDefs[fID] and UnitDefs[fID].metalCost or 0
                     local haveIt = false
                     for j = 1, st.myFactoriesCount do if spGetUnitDefID(st.myFactories[j]) == fID then haveIt = true break end end
@@ -5148,12 +5440,20 @@ local function ProcessUnitOrders(unitID, frame)
                         missingFacCost = fCost
                     end
                 end
+                for i = 1, #cache.factories do
+                    if IsVehicleFactory(cache.factories[i]) then considerFactory(cache.factories[i]) end
+                end
+                for i = 1, #cache.factories do
+                    if not IsVehicleFactory(cache.factories[i]) then considerFactory(cache.factories[i]) end
+                end
 
                 if missingFacID and not st.metalStalling and cfg.CanTechUpToFactory(missingFacID)
                     and (canExpand or availableMetal >= missingFacCost) then
                     defID = missingFacID
-                    local fAx, fAz = clampAnchor(ux, uz)
-                    tx, ty, tz, facing, key = FindBuildSpot(fAx, fAz, defID, cfg.BUILD_SPACING, unitID, conBuildDist, nil, facFacing)
+                    local fDef = UnitDefs[defID]
+                    local fHalf = (mMax(fDef and fDef.xsize or 8, fDef and fDef.zsize or 8) * 8) / 2
+                    local slotX, slotZ = cfg.ComputeFactoryRowSlot(ux, uz, facFacing, fHalf, cfg.TOUCH_GAP)
+                    tx, ty, tz, facing, key = FindBuildSpot(slotX, slotZ, defID, cfg.TOUCH_GAP, unitID, conBuildDist, nil, facFacing, nil, true)
                     if tx then claimRadius = IsAirFactory(defID) and 90 or select(2, FactoryTurretInfo(defID)) end
                 end
                 if not tx and canExpand and #cache.factories > 0 then
@@ -5166,8 +5466,10 @@ local function ProcessUnitOrders(unitID, frame)
                     end
                     if extraFacID then
                         defID = extraFacID
-                        local fAx, fAz = clampAnchor(ux, uz)
-                        tx, ty, tz, facing, key = FindBuildSpot(fAx, fAz, defID, cfg.BUILD_SPACING, unitID, conBuildDist, nil, facFacing)
+                        local fDef = UnitDefs[defID]
+                        local fHalf = (mMax(fDef and fDef.xsize or 8, fDef and fDef.zsize or 8) * 8) / 2
+                        local slotX, slotZ = cfg.ComputeFactoryRowSlot(ux, uz, facFacing, fHalf, cfg.TOUCH_GAP)
+                        tx, ty, tz, facing, key = FindBuildSpot(slotX, slotZ, defID, cfg.TOUCH_GAP, unitID, conBuildDist, nil, facFacing, nil, true)
                         if tx then claimRadius = IsAirFactory(defID) and 90 or select(2, FactoryTurretInfo(defID)) end
                     end
                 end
@@ -5281,12 +5583,17 @@ local function ProcessUnitOrders(unitID, frame)
             if tx and defID then
                 local isFac = UnitDefs[defID] and UnitDefs[defID].isFactory
                 local isMex = UnitDefs[defID] and UnitDefs[defID].extractsMetal and UnitDefs[defID].extractsMetal > 0
+                local econType = GetEconType(defID)
                 local isAntinuke = cfg.IsAntiNukeDef(defID)
                 st.claimedSpots[key] = { frame = frame, x = tx, z = tz, r2 = claimRadius * claimRadius, isFactory = isFac, isAirFactory = isFac and IsAirFactory(defID), facing = facing, defID = defID, isMex = isMex, isAntinuke = isAntinuke }
                 st.pendingCommittedMetal = st.pendingCommittedMetal + (UnitDefs[defID] and UnitDefs[defID].metalCost or 0)
                 if isFac then st.pendingFactoryBlueprints = st.pendingFactoryBlueprints + 1 end
                 if isAntinuke then st.pendingAntinukeBlueprints = st.pendingAntinukeBlueprints + 1 end
                 spGiveOrderToUnit(unitID, -defID, { tx, ty, tz, facing }, {})
+
+                if econType and not isFac and st.myFactoriesCount > 0 then
+                    QueueEcoBlock(unitID, defID, ux, uz, conBuildDist, isMex)
+                end
             else
                 if not tx and (st.unclaimedMexCount > 0 or #st.metalSpots == 0) then
                     local fDeficit = mMax(0, (st.metalPull or 0) - (st.metalIncome or 0))
@@ -5295,7 +5602,7 @@ local function ProcessUnitOrders(unitID, frame)
                     if st.activeMexBuilders < fBudget and #cache.mex > 0 then
                         local mexID = cache.mex[#cache.mex]
                         if CanAffordBuild(mexID, true) then
-                            local mx, my, mz, mf, mkey = FindBuildSpot(ux, uz, mexID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil, true)
+                            local mx, my, mz, mf, mkey = FindBuildSpot(ux, uz, mexID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil)
                             if mx then
                                 local mDef = UnitDefs[mexID]
                                 st.claimedSpots[mkey] = { frame = frame, x = mx, z = mz, r2 = (st.metalMapMexSpacing * 0.5) * (st.metalMapMexSpacing * 0.5), isFactory = false, isAirFactory = false, facing = mf, defID = mexID, isMex = true }
@@ -5303,17 +5610,6 @@ local function ProcessUnitOrders(unitID, frame)
                                 spGiveOrderToUnit(unitID, -mexID, { mx, my, mz, mf }, {})
                                 return
                             end
-                        end
-                    end
-                end
-
-                if not tx and st.unclaimedMexCount > 0 then
-                    local spot = GetNearestUnclaimedMetalSpot(ux, uz)
-                    if spot then
-                        local dx, dz = spot.x - ux, spot.z - uz
-                        if dx*dx + dz*dz > 200*200 and (not IsUnitBuildingFactory(unitID)) then
-                            local sx, sz = GetFlankSpreadPos(unitID, spot.x, spot.z, cfg.ANTI_CLUMP_MIN, cfg.ANTI_CLUMP_MAX, nil)
-                            spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { sx, spGetGroundHeight(sx, sz), sz }, {}) return
                         end
                     end
                 end
@@ -5352,20 +5648,6 @@ local function ProcessUnitOrders(unitID, frame)
                         spGiveOrderToUnit(unitID, cfg.CMD_REPAIR, { repairT }, {})
                         return
                     end
-                end
-
-                -- nothing to reclaim or repair
-                local bx, bz = st.baseCenterX or ux, st.baseCenterZ or uz
-                local dx, dz = bx - ux, bz - uz
-                if dx*dx + dz*dz > 400*400 and (not IsUnitBuildingFactory(unitID)) then
-                    spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { bx, spGetGroundHeight(bx, bz), bz }, {})
-                elseif (not IsUnitBuildingFactory(unitID)) then
-                    local patAngle = ((unitID % 251) + 1) * 0.025
-                    local patR = (st.baseRadius or 0) > 0 and st.baseRadius or 500
-                    local pmx, pmz = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
-                    local px = mMax(100, mMin(bx + mCos(patAngle) * patR, pmx - 100))
-                    local pz = mMax(100, mMin(bz + mSin(patAngle) * patR, pmz - 100))
-                    spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { px, spGetGroundHeight(px, pz), pz }, {})
                 end
             end
         end
@@ -5702,8 +5984,8 @@ local function ProcessUnitOrders(unitID, frame)
                         if tTeam and tTeam ~= myTeamID and not spAreTeamsAllied(myTeamID, tTeam) then
                             local tDef = UnitDefs[spGetUnitDefID(tID)]
                             if tDef and tDef.speed and tDef.speed > 0 then
-                                local ex, _, ez = spGetUnitPosition(tID)
-                                if ex then
+                                 local ex, _, ez = Spring.GetUnitViewPosition(tID) or spGetUnitPosition(tID)
+                                 if ex and ez then
                                     enemyMetal = enemyMetal + (tDef.metalCost or 50)
                                     local d = (ex - ux) * (ex - ux) + (ez - uz) * (ez - uz)
                                     if d < enemyDistSq then enemyDistSq, enemyX, enemyZ = d, ex, ez end
@@ -5764,8 +6046,8 @@ local function ProcessUnitOrders(unitID, frame)
                                 local tDef = UnitDefs[tDefID]
                                 enemyHP = enemyHP + (tDef and tDef.maxHealth or 100)
                             end
-                            local tx, _, tz = spGetUnitPosition(tID)
-                            if tx then
+                            local tx, _, tz = Spring.GetUnitViewPosition(tID) or spGetUnitPosition(tID)
+                            if tx and tz then
                                 local dx, dz = tx - ux, tz - uz
                                 local d = dx*dx + dz*dz
                                 if d < threatDistSq then threatDistSq, threatX, threatZ = d, tx, tz end
@@ -5797,6 +6079,7 @@ local function ProcessUnitOrders(unitID, frame)
                 else
                     tx, tz = cfg.GetTangentialRetreat(unitID, ux, uz, threatX, threatZ, retreatDist)
                 end
+                tx, tz = cfg.ClampToMapRadius(tx, tz)
                 local ty = spGetGroundHeight(tx, tz)
                 spGiveOrderToUnit(unitID, cfg.CMD_MOVE, { tx, ty, tz }, {})
                 return
@@ -5827,8 +6110,8 @@ local function ProcessUnitOrders(unitID, frame)
                             if tTeam and tTeam ~= myTeam and tTeam ~= gaia and not spAreTeamsAllied(myTeam, tTeam) then
                                 local tDef = UnitDefs[spGetUnitDefID(tID)]
                                 if tDef and (not tDef.speed or tDef.speed == 0) and cfg.IsJunoVulnerableDef(tDef) then
-                                    local tx, _, tz = spGetUnitPosition(tID)
-                                    if tx then
+                                     local tx, _, tz = Spring.GetUnitViewPosition(tID) or spGetUnitPosition(tID)
+                                     if tx and tz then
                                         local d = (tx - ux) * (tx - ux) + (tz - uz) * (tz - uz)
                                         if d < jDistSq then
                                             jDistSq, jID, jX, jZ = d, tID, tx, tz
@@ -5875,8 +6158,8 @@ local function ProcessUnitOrders(unitID, frame)
 
             if bestID then
                     if nearRaid and not uDef.canFly then
-                        local raiderX, _, raiderZ = spGetUnitPosition(bestID)
-                        if not raiderX then raiderX, raiderZ = cx, cz end
+                        local raiderX, _, raiderZ = Spring.GetUnitViewPosition(bestID) or spGetUnitPosition(bestID)
+                        if not raiderX or not raiderZ then raiderX, raiderZ = cx, cz end
                         local alreadyCharging = false
                         if cmd1 and cmd1.id == cfg.CMD_MOVE and cmd1.params and cmd1.params[1] and cmd1.params[3] then
                             local ddx, ddz = raiderX - cmd1.params[1], raiderZ - cmd1.params[3]
@@ -5896,8 +6179,7 @@ local function ProcessUnitOrders(unitID, frame)
                         if not alreadyAttacking then
                             if st.attackDbg then
                                 st.attackDbg.issued = st.attackDbg.issued + 1
-                                if uDef.canFly then st.attackDbg.airIssued = st.attackDbg.airIssued + 1
-                                else st.attackDbg.groundIssued = st.attackDbg.groundIssued + 1 end
+                                st.attackDbg.airIssued = st.attackDbg.airIssued + 1
                                 st.attackDbg.lastIssuedDef = uDef.name
                             end
                             spGiveOrderToUnit(unitID, cfg.CMD_ATTACK, { bestID }, {})
@@ -5951,8 +6233,8 @@ local function ProcessUnitOrders(unitID, frame)
                                         local tDef = UnitDefs[tDefID]
                                         enemyHP = enemyHP + (tDef and tDef.maxHealth or 100)
                                     end
-                                    local ex, _, ez = spGetUnitPosition(tID)
-                                    if ex then
+                local ex, _, ez = Spring.GetUnitViewPosition(tID) or spGetUnitPosition(tID)
+                                    if ex and ez then
                                         local dx, dz = ex - ux, ez - uz
                                         local d = dx*dx + dz*dz
                                         if d < nDistSq then
@@ -6062,8 +6344,8 @@ local function ProcessUnitOrders(unitID, frame)
                     if isGround and clusterSize >= cfg.CLUSTER_THRESHOLD then
                         sx, sz = GetFlankSpreadPos(unitID, cx, cz, eMinR, eMaxR, nil)
                     else
-                        local ex, ey, ez = spGetUnitPosition(bestID)
-                        if ex then
+                        local ex, ey, ez = Spring.GetUnitViewPosition(bestID) or spGetUnitPosition(bestID)
+                        if ex and ez then
                             sx, sz = GetFlankSpreadPos(unitID, ex, ez, eMinR, eMaxR, bestID)
                         end
                     end
@@ -6101,12 +6383,10 @@ local function ProcessUnitOrders(unitID, frame)
             st.frameNum = frame
 
             local tgtX, tgtY, tgtZ = st.army.targetX, st.army.targetY, st.army.targetZ
+
+            local scanR = mFloor(mMin(Game.mapSizeX or 8192, Game.mapSizeZ or 8192) * 0.5)
             local cx, cy, cz, bestID, clusterSize, bestMetal, isGround =
-                FindBestClusterTarget(ux, uz, 1600, cfg.AOE_DAMAGE_RADIUS, uDefID)
-            if not cx and tgtX then
-                cx, cy, cz, bestID, clusterSize, bestMetal, isGround =
-                    FindBestClusterTarget(tgtX, tgtZ, 1500, cfg.AOE_DAMAGE_RADIUS, uDefID)
-            end
+                FindBestClusterTarget(ux, uz, scanR, cfg.AOE_DAMAGE_RADIUS, uDefID)
 
             if cx then
                 local tDefID = bestID and spGetUnitDefID(bestID)
@@ -6153,6 +6433,11 @@ local function ProcessUnitOrders(unitID, frame)
                         end
                     end
                     if targetEnemy then
+                        if st.attackDbg then
+                            st.attackDbg.issued = st.attackDbg.issued + 1
+                            st.attackDbg.groundIssued = st.attackDbg.groundIssued + 1
+                            st.attackDbg.lastIssuedDef = uDef.name
+                        end
                         spGiveOrderToUnit(unitID, cfg.CMD_ATTACK, { targetEnemy }, {})
                         return
                     else
@@ -6306,13 +6591,34 @@ function widget:GameFrame(frame)
                 td.probeTiles, td.probeBlocked, td.probeInacc, td.probeOverlap, td.probeTest, td.probeExit, td.probeBounds,
                 td.lastRingOut or 0, td.lastSpacing or 0, td.lastDef or "?")
         end
+        local cooldownCount = 0
+        if st.factoryTurretCooldown then
+            for fid, untilFrame in pairs(st.factoryTurretCooldown) do
+                if untilFrame and untilFrame >= st.frameNum then cooldownCount = cooldownCount + 1 end
+            end
+        end
         Spring.Echo(string.format(
-            "[MetalAI] turret: consCanBuild=%d needRing=%d fired=%d placed=%d (noCon=%d noNeed=%d noAfford=%d noSpot=%d)%s",
+            "[MetalAI] turret: consCanBuild=%d needRing=%d fired=%d placed=%d total=(%d placed) cooldown=%d (noCon=%d noNeed=%d noAfford=%d noSpot=%d)%s",
             td.consWithTurret or 0, td.needTurrets or 0,
             td.fired or 0, td.placed or 0,
+            td.placedTotal or 0, cooldownCount,
             td.noCon or 0, td.noNeed or 0, td.noAfford or 0, td.noSpot or 0, probe))
         td.fired, td.placed = 0, 0
         td.noCon, td.noNeed, td.noAfford, td.noSpot = 0, 0, 0, 0
+
+        local ed = st.ecoDbg
+        local es = st.ecoStrip
+        local stripInfo = "none"
+        if es then stripInfo = sFormat("step=%d next=%d horiz=%s def=%s", es.step or 0, es.next or 0, tostring(es.horiz), es.defID and (UnitDefs[es.defID] and UnitDefs[es.defID].name or "?") or "?") end
+        Spring.Echo(sFormat(
+            "[MetalAI] eco: strip(%s) needM=%d needE=%d mOrd=%d eOrd=%d ecoR=(%d,%d) activeEco(%d,%d)",
+            stripInfo,
+            ed.needMetal or 0, ed.needEnergy or 0,
+            ed.metalOrders or 0, ed.energyOrders or 0,
+            math.floor(st.metalIncome or 0), math.floor(st.energyIncome or 0),
+            st.activeMexBuilders or 0, st.activeEnergyBuilders or 0))
+        ed.needMetal, ed.needEnergy = 0, 0
+        ed.metalOrders, ed.energyOrders = 0, 0
 
         local ad = st.attackDbg
         if ad and (ad.issued > 0 or ad.groundCleared > 0) then
