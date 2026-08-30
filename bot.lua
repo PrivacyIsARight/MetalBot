@@ -5414,10 +5414,10 @@ local function ProcessUnitOrders(unitID, frame)
             if not tx and #cache.factories > 0 and activeFactoryBuilds < 6 and st.myFactoriesCount > 0 then
 
                 local availableMetal = mMax(0, st.currentMetal - st.pendingCommittedMetal)
-                local supportableFactories = mMin(math.floor(st.metalIncome / 10), mMax(2, math.floor(st.mapLinearScale * 4)))
+                local supportableFactories = mMin(math.floor(st.metalIncome / 10), mMax(2, math.floor(st.mapAreaScale * 4)))
                 local canExpand = st.economySaturated
                     or (st.myFactoriesCount < supportableFactories and not st.metalStalling and st.metalIncome >= 15)
-                    or (st.metalIncome >= 30 and st.myFactoriesCount < mMax(2, math.floor(st.mapLinearScale * 3)) and not st.metalStalling)
+                    or (st.metalIncome >= 30 and st.myFactoriesCount < mMax(2, math.floor(st.mapAreaScale * 3)) and not st.metalStalling)
                 if st.plan.mode == "army" and st.metalIncome >= 20 and not st.metalStalling then
                     canExpand = true
                 end
