@@ -4167,13 +4167,13 @@ end
 -- no combat unit is ever left idle
 local function PushFrontier(unitID, ux, uz)
     local fX, fZ = GetForwardTarget()
+    local mapX, mapZ = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
     if fX then
         local dir = mAtan2(fZ - uz, fX - ux)
         local lat = (UnitHash(unitID, 6) - 0.5) * 2.2
-        local leg = 600 + UnitHash(unitID, 7) * 400
+        local leg = mMin(mapX, mapZ) * (0.075 + UnitHash(unitID, 7) * 0.05)
         local tx = ux + mCos(dir + lat) * leg
         local tz = uz + mSin(dir + lat) * leg
-        local mapX, mapZ = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
         tx = mMax(80, mMin(tx, mapX - 80))
         tz = mMax(80, mMin(tz, mapZ - 80))
         tx, tz = NudgeOutOfLava(tx, tz, ux, uz)
@@ -4181,14 +4181,13 @@ local function PushFrontier(unitID, ux, uz)
     else
         -- no enemy known: push toward the far half of the map instead of roaming our side
         local homeX, homeZ = st.baseCenterX, st.baseCenterZ
-        local mapX, mapZ = Game.mapSizeX or 8192, Game.mapSizeZ or 8192
         local dirX, dirZ = mapX * 0.5 - (homeX or ux), mapZ * 0.5 - (homeZ or uz)
         local dirLen = math.sqrt(dirX * dirX + dirZ * dirZ)
         local px, pz = ux, uz
         if dirLen > 1e-6 then
             dirX, dirZ = dirX / dirLen, dirZ / dirLen
             local lat = (UnitHash(unitID, 6) - 0.5) * 1.6
-            local leg = 700 + UnitHash(unitID, 7) * 500
+            local leg = mMin(mapX, mapZ) * (0.085 + UnitHash(unitID, 7) * 0.062)
             local dir = mAtan2(dirZ, dirX)
             px = ux + mCos(dir + lat) * leg
             pz = uz + mSin(dir + lat) * leg
