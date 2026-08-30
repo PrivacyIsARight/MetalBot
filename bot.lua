@@ -930,10 +930,20 @@ local function IsTrapper(uDef)
     if sFind(name, "trap") then return true end
     if uDef.customParams and (uDef.customParams.trap ~= nil or uDef.customParams.istrap ~= nil) then return true end
     if uDef.isBuilder and uDef.buildOptions then
+        local hasMine = false
         for i = 1, #uDef.buildOptions do
             local optDef = UnitDefs[uDef.buildOptions[i]]
-            if optDef and sFind(sLower(optDef.name or ""), "mine") then return true end
+            if not optDef then break end
+            if optDef.extractsMetal and optDef.extractsMetal > 0 then return false end
+            local eg = optDef.energyMake
+            if eg and eg > 0 then return false end
+            local wg = optDef.windGenerator
+            if wg == true or (type(wg) == "number" and wg > 0) then return false end
+            local on = sLower(optDef.name or "")
+            if sFind(on, "solar") or sFind(on, "wind") or sFind(on, "fusion") or sFind(on, "geo") then return false end
+            if sFind(on, "mine") then hasMine = true end
         end
+        if hasMine then return true end
     end
     return false
 end
