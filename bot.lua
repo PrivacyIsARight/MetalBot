@@ -230,7 +230,6 @@ local cfg = {
     BUILD_SPACING         = 384,    -- grid spacing for factory/eco placement
     ENERGY_GRID_SPACING   = 64,
     ENERGY_LINE_LEN       = 4,
-    ECO_CONS_FRACTION     = 0.4,
     SHIELD_GRID_SPACING   = 256,
     TURRET_SPACING        = 80,
     MIN_SPACING           = 32,     -- I don't think you can build stuff this close, but it (might?) help out performance wise adding this
@@ -344,8 +343,6 @@ local cfg = {
 
     ECO_BLOCK_COPY_RADIUS    = 1200,
 
-    MEX_SKIP_DIST         = 1000,  -- skip walking to a mex spot further than this
-
     ARMY_DEPRECIATION_RATE = 0.02, -- get the army moving, t1s are more useful early on
 
     ANTI_CLUMP_MIN         = 220,
@@ -365,7 +362,6 @@ local st = {
     buildCache                   = {},
     lastFactoryOrderFrame        = {},
     claimedSpots                 = {},
-
     myFactories                  = {},
     myFactoriesCount             = 0,
     factoryGuards                = {},
@@ -859,7 +855,6 @@ function widget:UnitDestroyed(unitID, unitDefID, teamID)
     st.factoryWaitState[unitID] = nil
     st.lastFactoryOrderFrame[unitID] = nil
     st.fireStateSet[unitID] = nil
-    st.moveStateSet[unitID] = nil
     st.flyStateSet[unitID] = nil
     st.combatReaimFrame[unitID] = nil
     retreatDirCache[unitID] = nil
@@ -1321,58 +1316,6 @@ local function GetAdvancedVehicleFactory(cache)
     end
 
     return best
-end
-
-
-local function GetNearestUnclaimedMetalSpot(ux, uz)
-    local spots = st.unclaimedMetalSpots
-    if not spots or #spots == 0 then 
-        return nil, mHuge 
-    end
-
-    local claims = st.claimedMexList
-    if not claims then claims = {} end
-
-    local bestSpot, bestDistSq = nil, mHuge
-    local CLAIM_RADIUS_SQ = 4096
-
-    for i = 1, #spots do
-        local spot = spots[i]
-        local sx, sz = spot.x, spot.z
-        local isClaimed = false
-
-        for k = 1, #claims do
-            local claim = claims[k]
-            local dx = claim.x - sx
-            local dx2 = dx * dx
-            if dx2 < CLAIM_RADIUS_SQ then
-                local dz = claim.z - sz
-                local dz2 = dz * dz
-                if dz2 < CLAIM_RADIUS_SQ and (dx2 + dz2) < CLAIM_RADIUS_SQ then
-                    isClaimed = true
-                    break
-                end
-            end
-        end
-
-        if not isClaimed then
-            local dx = sx - ux
-            local dx2 = dx * dx
-            if dx2 < bestDistSq then
-                local dz = sz - uz
-                local dz2 = dz * dz
-                if dz2 < bestDistSq then
-                    local distSq = dx2 + dz2
-                    if distSq < bestDistSq then
-                        bestDistSq = distSq
-                        bestSpot = spot
-                    end
-                end
-            end
-        end
-    end
-
-    return bestSpot, bestDistSq
 end
 
 
@@ -2536,8 +2479,6 @@ local function FindBuildSpot(ux, uz, defID, spacingOverride, excludeUnitID, pref
 
     local maxRing = mFloor(cfg.BUILD_RADIUS / stepSize)
 
-    -- We should prefer spots within the builder's own build distance; and only fall back
-    -- to the full search radius only if nothing is buildable nearby.
     local preferRing = preferRadius and mFloor(preferRadius / stepSize) or maxRing
     if preferRing < 0 then preferRing = 0 elseif preferRing > maxRing then preferRing = maxRing end
 
@@ -2733,8 +2674,6 @@ local function FindBuildSpot(ux, uz, defID, spacingOverride, excludeUnitID, pref
     end
     if bestTX then ClaimSpot(bestKey, bestTX, bestTZ, bestF) return bestTX, bestTY, bestTZ, bestF, bestKey end
 
-    -- Tight mode (eco/mex): only build close in; never send the builder
-    -- sprinting to the far edge of the search ring.
     if tight then return nil end
 
     -- Phase 2: nothing buildable within the prefer square - extend outward.
@@ -3255,7 +3194,7 @@ local function ComputeStrategicPlan(frame)
     -- as the enemy techs up
     local ourTech = mMax(1, st.ourTech or 1)
     local enemyTech = mMax(ourTech, st.enemyTech or ourTech)
-    local techPressure = mMin(6, enemyTech / ourTech)
+    local techPressure = enemyTech / ourTech
 
     local armyValue = st.armyValue or 0
     local depreciation = armyValue * techPressure * cfg.ARMY_DEPRECIATION_RATE
@@ -3273,7 +3212,7 @@ local function ComputeStrategicPlan(frame)
 
     local raiderThreat = (st.raiderCount or 0) * 5
     local myArmy = st.myCombatUnitCount or 0
-    local armyReadiness = myArmy / mMax(cfg.ARMY_MIN_SIZE * 3, myArmy + cfg.ARMY_MIN_SIZE)
+    local armyReadiness = myArmy / (myArmy + cfg.ARMY_MIN_SIZE)
     local armyScore = (depreciation + tempo + raiderThreat) * armyReadiness
     if st.army.state == "attacking" then armyScore = armyScore * 1.5 end
 
@@ -4006,21 +3945,24 @@ local function UpdateDefenseCoordination(frame)
     end
 
     local udbg = st.uneaseDbg
-    if not st.unease or st.unease <= 0 then return end
+    local defenseThreshold = mMax((st.armyValue or 0) * cfg.UNEASE_ARMY_RATIO, 200)
+    if not st.unease or st.unease < defenseThreshold or not st.uneaseX then return end
     udbg.detected = udbg.detected + 1
-    if not st.uneaseX then return end
     udbg.fired = udbg.fired + 1
     udbg.lastUnease = mFloor(st.unease)
 
+    local recallR2 = 3000 * 3000
     local cands = {}
     for i = 1, st.myCombatUnitCount do
         local uID = st.myCombatUnits[i]
         local ux, _, uz = spGetUnitPosition(uID)
         if ux then
             local ddx, ddz = ux - st.uneaseX, uz - st.uneaseZ
-            local uDef = UnitDefs[spGetUnitDefID(uID)]
-            local speed = uDef and uDef.speed or 0
-            cands[#cands + 1] = { id = uID, eta = (speed > 0) and (mSqrt(ddx * ddx + ddz * ddz) / speed) or mHuge }
+            if ddx * ddx + ddz * ddz <= recallR2 then
+                local uDef = UnitDefs[spGetUnitDefID(uID)]
+                local speed = uDef and uDef.speed or 0
+                cands[#cands + 1] = { id = uID, eta = (speed > 0) and (mSqrt(ddx * ddx + ddz * ddz) / speed) or mHuge }
+            end
         end
     end
     if #cands == 0 then
@@ -4029,7 +3971,7 @@ local function UpdateDefenseCoordination(frame)
     end
     tSort(cands, SortDefenders)
     local budget = st.unease * cfg.UNEASE_OVERRUN_RATIO
-    local spent, recalled = 0, 0
+    local spent = 0
     for i = 1, #cands do
         if spent >= budget then break end
         local uID = cands[i].id
@@ -4048,7 +3990,6 @@ local function UpdateDefenseCoordination(frame)
         -- Already-heading units count toward the budget too
         local uDef = spGetUnitDefID(uID) and UnitDefs[spGetUnitDefID(uID)]
         spent = spent + ((uDef and uDef.metalCost) or 50)
-        recalled = recalled + 1
         udbg.recalled = udbg.recalled + 1
     end
 end
@@ -4434,9 +4375,8 @@ local function ProcessUnitOrders(unitID, frame)
                 end
             end
 
-            -- cap defenders so the factory doesn't only make fighters
             local targetDefenders = 4
-            if st.raiderCount > 0 then targetDefenders = mMin(10, mMax(6, st.raiderCount * 2)) end
+            if st.raiderCount > 0 then targetDefenders = st.raiderCount * 2 end
 
             if not choice and not queueFull and st.conUnitCount < maxCons and #cache.cons > 0 then
                 choice = PickPreferAir(cache.cons, false)
@@ -4500,7 +4440,7 @@ local function ProcessUnitOrders(unitID, frame)
             end
 
             if not choice and #cache.scouts > 0 then
-                local targetScouts = mMin(4, mMax(2, cfg.SCOUTS_PER_FACTORY * st.myFactoriesCount))
+                local targetScouts = cfg.SCOUTS_PER_FACTORY * st.myFactoriesCount
                 if st.scoutUnitCount < targetScouts then
                     local cheapestScout, cheapestCost = nil, mHuge
                     for i = 1, #cache.scouts do
@@ -5208,10 +5148,6 @@ local function ProcessUnitOrders(unitID, frame)
                 local energyDeficit = mMax(0, (st.energyPull or 0) - (st.energyIncome or 0))
                 local mexBudget = mMax(1, mMin(math.ceil(metalDeficit / cfg.GetMexGain()), mMax(1, st.unclaimedMexCount or 0)))
                 local energyBudget = mMax(1, math.ceil(energyDeficit / cfg.GetEnergyGain()))
-                local totalCons = mMax(1, st.conUnitCount)
-                local ecoConsCap = mMax(1, mFloor(totalCons * (cfg.ECO_CONS_FRACTION or 0.4)))
-                if mexBudget > ecoConsCap then mexBudget = ecoConsCap end
-                if energyBudget > ecoConsCap then energyBudget = ecoConsCap end
 
                 local needMetal = (st.metalStalling or st.unclaimedMexCount > 0) and not overflowingMetal
                 local needEnergy = st.energyStalling or ((st.energyIncome < targetEnergy) and not overflowingEnergy)
@@ -5238,7 +5174,9 @@ local function ProcessUnitOrders(unitID, frame)
                     end
                 end
                 if needEnergy and needMetal then
-                    if st.energyStalling then needMetal = false elseif st.metalStalling then needEnergy = false
+                    if st.energyStalling then needMetal = false
+                    elseif (st.energyPull or 0) > (st.energyIncome or 0) then needMetal = false
+                    elseif st.metalStalling then needEnergy = false
                     elseif st.plan.mode == "energy" then needMetal = false
                     elseif st.plan.mode == "mex" then needEnergy = false
                     else if math.random() < 0.65 then needMetal = false else needEnergy = false end end
@@ -5270,18 +5208,8 @@ local function ProcessUnitOrders(unitID, frame)
 
                     if chosenMex then
                         defID = chosenMex
-                        local nearestMex, mexDistSq = GetNearestUnclaimedMetalSpot(ux, uz)
 
-                        local skipMetal = false
-                        if nearestMex and mexDistSq > (cfg.MEX_SKIP_DIST * st.mapLinearScale) * (cfg.MEX_SKIP_DIST * st.mapLinearScale) and st.conUnitCount > 1 then
-                            if not st.metalStalling or (st.metalStalling and st.activeMexBuilders >= 2) then skipMetal = true end
-                        end
-
-                        if skipMetal then
-                            defID = nil
-                        else
-                            tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil)
-                        end
+                        tx, ty, tz, facing, key = FindBuildSpot(ux, uz, defID, st.metalMapMexSpacing, unitID, conBuildDist, nil, nil, nil)
 
                         if tx and defID then
                             claimRadius = st.metalMapMexSpacing * 0.5
@@ -5317,7 +5245,7 @@ local function ProcessUnitOrders(unitID, frame)
                         s.step = mMax(eSpacing, 48)
                         local lineLen = cfg.ENERGY_LINE_LEN or 12
                         local tries = 0
-                        while tries < lineLen do
+                        while tries < lineLen * 4 do
                             tries = tries + 1
                             local sx, sz = NextEcoStripSlot(eSpacing, lineLen)
                             if not sx then break end
@@ -5419,14 +5347,12 @@ local function ProcessUnitOrders(unitID, frame)
                 st.turretDbg.noCon = st.turretDbg.noCon + 1
             end
 
-            local activeFactoryBuilds = st.incompleteFactoryCount + st.pendingFactoryBlueprints
-            if not tx and #cache.factories > 0 and activeFactoryBuilds < 6 and st.myFactoriesCount > 0 then
-
+            if not tx and #cache.factories > 0 and st.myFactoriesCount > 0 then
                 local availableMetal = mMax(0, st.currentMetal - st.pendingCommittedMetal)
-                local supportableFactories = mMin(math.floor(st.metalIncome / 10), mMax(2, math.floor(st.mapAreaScale * 4)))
+                local supportableFactories = math.floor(st.metalIncome / 10)
                 local canExpand = st.economySaturated
                     or (st.myFactoriesCount < supportableFactories and not st.metalStalling and st.metalIncome >= 15)
-                    or (st.metalIncome >= 30 and st.myFactoriesCount < mMax(2, math.floor(st.mapAreaScale * 3)) and not st.metalStalling)
+                    or (st.metalIncome >= 30 and st.myFactoriesCount < math.floor(st.mapAreaScale * 3) and not st.metalStalling)
                 if st.plan.mode == "army" and st.metalIncome >= 20 and not st.metalStalling then
                     canExpand = true
                 end
@@ -5509,9 +5435,9 @@ local function ProcessUnitOrders(unitID, frame)
 
             -- lol this doesn't do anything, the bot doesn't understand radar
             -- good for the future though, hopefully whenever that can be fixed
-            if not tx and #cache.radarTowers > 0 and st.myFactoriesCount > 0 then
-                local radarTowerBudget = mMin(4, 1 + math.floor((st.metalIncome or 0) / 100))
-                if (st.radarTowerCount or 0) < radarTowerBudget and not st.metalStalling and not st.energyStalling then
+            if not tx and #cache.radarTowers > 0 and st.myFactoriesCount > 0 and st.economySaturated then
+                local radarTowerBudget = 1 + math.floor((st.metalIncome or 0) / 100)
+                if (st.radarTowerCount or 0) < radarTowerBudget then
                     local rID = cache.radarTowers[1]
                     if CanAffordBuild(rID) then
                         defID = rID
@@ -5523,14 +5449,14 @@ local function ProcessUnitOrders(unitID, frame)
                 end
             end
 
-            if not tx and st.myFactoriesCount > 0 then
+            if not tx and st.myFactoriesCount > 0 and st.economySaturated then
                 if #cache.defensesGround > 0 then
                     local dID = SelectBalancedDefense(cache.defensesGround, st.currentMetal)
                     local turretCost = (UnitDefs[dID] and UnitDefs[dID].metalCost) or 1
                     local targetGround = st.myFactoriesCount * cfg.DEFENSE_MIN_PER_FACTORY
                         + math.floor((st.unease or 0) / turretCost)
                         + math.floor((st.enemyArmyValue or 0) / (turretCost * cfg.DEFENSE_ARMY_TURRET_RATIO))
-                    if (st.defenseGroundCount or 0) < targetGround and not st.metalStalling and not st.energyStalling then
+                    if (st.defenseGroundCount or 0) < targetGround then
                         if CanAffordBuild(dID, false) then
                             defID = dID
                         end
@@ -5542,7 +5468,7 @@ local function ProcessUnitOrders(unitID, frame)
                     local turretCost = (UnitDefs[dID] and UnitDefs[dID].metalCost) or 1
                     local targetAA = st.myFactoriesCount * cfg.DEFENSE_MIN_PER_FACTORY
                         + math.floor((st.enemyArmyValue or 0) / (turretCost * cfg.DEFENSE_ARMY_TURRET_RATIO * 2))
-                    if (st.defenseAACount or 0) < targetAA and not st.metalStalling and not st.energyStalling then
+                    if (st.defenseAACount or 0) < targetAA then
                         if CanAffordBuild(dID, false) then
                             defID = dID
                         end
